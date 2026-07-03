@@ -1,14 +1,14 @@
 """Local-backend agent loop: one envelope per turn, guarded execution.
 
 Copyright (c) 2026 DigiSpark Advisory LLC. All rights reserved.
-Clean-room implementation authored from SPEC.md §2.1/§3/§5 and the PUBLIC
-Apache-2.0 Selora AI model card (v0.4.7) — see PROVENANCE.md.
+Clean-room implementation authored from SPEC.md 2.1/3/5 and the PUBLIC
+Apache-2.0 Selora AI model card (v0.4.7) - see PROVENANCE.md.
 
 The local specialists emit an envelope IR instead of using the generic tool
 protocol, so this loop replaces the iterate-until-answer loop for the local
 provider (design settled 2026-07-03): classify the request to a specialist
 with a deterministic heuristic router, make one chat call, parse the
-envelope, and execute any proposed actions through HomeToolRunner.run_tool —
+envelope, and execute any proposed actions through HomeToolRunner.run_tool -
 the same guard, per-turn action budget, and pending-confirmation queue as
 the cloud path. safety/policy.py stays the single choke point; a routing
 mistake can cost answer quality, never safety.
@@ -106,7 +106,7 @@ def classify_specialist(message: str, *, continue_specialist: str | None = None)
 
 
 class LocalAgentLoop:
-    """Runs one user turn against the local backend (SPEC §2.1).
+    """Runs one user turn against the local backend (SPEC 2.1).
 
     Presents the same surface the WS layer uses on AgentLoop: ``history``,
     ``reset()``, and ``run_turn()`` returning a TurnResult.
@@ -258,7 +258,7 @@ class LocalAgentLoop:
         """Turn one vetted envelope into effects + final text.
 
         Every action goes through HomeToolRunner.run_tool, i.e. the guard,
-        the per-turn budget, and the pending-confirmation queue (SPEC §5).
+        the per-turn budget, and the pending-confirmation queue (SPEC 5).
         Outcome lines are appended so refused or queued actions are visible
         to the user, never silent.
         """
