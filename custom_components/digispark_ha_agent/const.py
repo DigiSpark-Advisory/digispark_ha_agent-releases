@@ -21,6 +21,25 @@ PROVIDER_ANTHROPIC = "anthropic"
 PROVIDER_LOCAL = "local"
 SUPPORTED_PROVIDERS: tuple[str, ...] = (PROVIDER_ANTHROPIC, PROVIDER_LOCAL)
 
+# Custom Anthropic-compatible endpoint (SPEC.md §2.2, v0.4.1): gateways and
+# proxies that speak the Messages API. Empty base URL = api.anthropic.com.
+CONF_BASE_URL = "base_url"
+CONF_CREDENTIAL_KIND = "credential_kind"
+CONF_CREDENTIAL_HEADER = "credential_header"
+# Raw "Name: value" lines; parsed by config_schema.parse_extra_headers.
+# Stored in entry.data and treated as secret (may carry tenant/org tokens).
+CONF_EXTRA_HEADERS = "extra_headers"
+CREDENTIAL_KIND_X_API_KEY = "x-api-key"
+CREDENTIAL_KIND_BEARER = "bearer"
+CREDENTIAL_KIND_CUSTOM = "custom_header"
+CREDENTIAL_KIND_NONE = "none"
+CREDENTIAL_KINDS: tuple[str, ...] = (
+    CREDENTIAL_KIND_X_API_KEY,
+    CREDENTIAL_KIND_BEARER,
+    CREDENTIAL_KIND_CUSTOM,
+    CREDENTIAL_KIND_NONE,
+)
+
 # Local backend (SPEC.md §2.1). The host is stored in entry.data; cleartext
 # http is only accepted for explicitly local hosts (providers/local.py).
 CONF_HOST = "host"

@@ -7,7 +7,11 @@
         "data": {
           "provider": "Provider",
           "api_key": "API key (cloud providers)",
-          "host": "Local backend URL (local provider)"
+          "host": "Local backend URL (local provider)",
+          "base_url": "Custom endpoint base URL (optional, Anthropic-compatible)",
+          "credential_kind": "Credential kind",
+          "credential_header": "Credential header name (custom_header kind only)",
+          "extra_headers": "Extra inference headers (one \"Name: value\" per line)"
         }
       },
       "model": {
@@ -22,7 +26,11 @@
     "error": {
       "api_key_required": "An API key is required for this provider.",
       "invalid_host": "Enter the local backend as an http(s) URL.",
-      "cleartext_remote_host": "Cleartext http is only allowed for local hosts; use https for remote backends."
+      "cleartext_remote_host": "Cleartext http is only allowed for local hosts; use https for remote backends.",
+      "invalid_base_url": "Enter the custom endpoint as an http(s) URL.",
+      "cleartext_remote_base_url": "Cleartext http is only allowed for local endpoints; use https for remote gateways.",
+      "credential_header_required": "The custom_header credential kind needs a header name.",
+      "invalid_extra_headers": "Extra headers must be one \"Name: value\" per line; credential and protocol headers are not allowed here."
     }
   },
   "options": {

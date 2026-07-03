@@ -13,12 +13,19 @@ tuples here, a field can never be collected on one path yet dropped on the other
 
 from __future__ import annotations
 
+import re
+
 from .const import (
     CONF_API_KEY,
+    CONF_BASE_URL,
+    CONF_CREDENTIAL_HEADER,
+    CONF_CREDENTIAL_KIND,
+    CONF_EXTRA_HEADERS,
     CONF_HOST,
     CONF_MAX_TOKENS,
     CONF_MODEL,
     CONF_PROVIDER,
+    CREDENTIAL_KIND_X_API_KEY,
     DEFAULT_LOCAL_HOST,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
@@ -30,11 +37,23 @@ FORM_FIELDS: tuple[str, ...] = (
     CONF_PROVIDER,
     CONF_API_KEY,
     CONF_HOST,
+    CONF_BASE_URL,
+    CONF_CREDENTIAL_KIND,
+    CONF_CREDENTIAL_HEADER,
+    CONF_EXTRA_HEADERS,
     CONF_MODEL,
     CONF_MAX_TOKENS,
 )
 # Identity/secret fields — stored in entry.data, set once at create.
-DATA_FIELDS: tuple[str, ...] = (CONF_PROVIDER, CONF_API_KEY, CONF_HOST)
+DATA_FIELDS: tuple[str, ...] = (
+    CONF_PROVIDER,
+    CONF_API_KEY,
+    CONF_HOST,
+    CONF_BASE_URL,
+    CONF_CREDENTIAL_KIND,
+    CONF_CREDENTIAL_HEADER,
+    CONF_EXTRA_HEADERS,
+)
 # Tunable fields — stored in entry.options, set at create and editable later.
 OPTION_FIELDS: tuple[str, ...] = (CONF_MODEL, CONF_MAX_TOKENS)
 
@@ -44,6 +63,12 @@ DATA_DEFAULTS: dict = {
     # (SPEC.md §2.1) needs none, so the field defaults to empty.
     CONF_API_KEY: "",
     CONF_HOST: DEFAULT_LOCAL_HOST,
+    # Custom Anthropic-compatible endpoint (SPEC.md §2.2): empty means the
+    # public API; credential kind defaults to Anthropic's own header.
+    CONF_BASE_URL: "",
+    CONF_CREDENTIAL_KIND: CREDENTIAL_KIND_X_API_KEY,
+    CONF_CREDENTIAL_HEADER: "",
+    CONF_EXTRA_HEADERS: "",
 }
 OPTION_DEFAULTS: dict = {
     CONF_MODEL: DEFAULT_MODEL,
@@ -68,6 +93,45 @@ def build_options(user_input: dict) -> dict:
     Uses the same OPTION_FIELDS as the create path so the two cannot drift.
     """
     return {k: user_input.get(k, OPTION_DEFAULTS.get(k)) for k in OPTION_FIELDS}
+
+
+# Headers the integration manages itself; the free-form field may never carry
+# credentials or override protocol headers (SPEC.md §2.2).
+_RESERVED_EXTRA_HEADERS = frozenset(
+    {"x-api-key", "authorization", "anthropic-version", "content-type"}
+)
+_HEADER_NAME_OK = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+
+
+def parse_extra_headers(text: str) -> dict[str, str]:
+    """Parse the extra-headers field: one ``Name: value`` per non-empty line.
+
+    Raises ValueError on a malformed line, an invalid header name, or a
+    reserved name. Values may contain colons (only the first splits).
+    """
+    headers: dict[str, str] = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        name, sep, value = line.partition(":")
+        name = name.strip()
+        value = value.strip()
+        if not sep or not name or not value or not _HEADER_NAME_OK.match(name):
+            raise ValueError(f"malformed header line: {line!r}")
+        if name.lower() in _RESERVED_EXTRA_HEADERS:
+            raise ValueError(f"header {name!r} is reserved")
+        headers[name] = value
+    return headers
+
+
+def extra_headers_problem(text: str) -> str | None:
+    """Error key for the config form, or None when the field parses."""
+    try:
+        parse_extra_headers(text)
+    except ValueError:
+        return "invalid_extra_headers"
+    return None
 
 
 def model_choices(fetched: list[str], current: str) -> list[str]:

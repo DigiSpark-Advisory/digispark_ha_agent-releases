@@ -13,13 +13,18 @@ from typing import TYPE_CHECKING
 
 from .agent.local_loop import LocalAgentLoop
 from .agent.loop import AgentLoop
-from .config_schema import OPTION_DEFAULTS
+from .config_schema import OPTION_DEFAULTS, parse_extra_headers
 from .const import (
     CONF_API_KEY,
+    CONF_BASE_URL,
+    CONF_CREDENTIAL_HEADER,
+    CONF_CREDENTIAL_KIND,
+    CONF_EXTRA_HEADERS,
     CONF_HOST,
     CONF_MAX_TOKENS,
     CONF_MODEL,
     CONF_PROVIDER,
+    CREDENTIAL_KIND_X_API_KEY,
     DEFAULT_LOCAL_HOST,
     PROVIDER_ANTHROPIC,
     PROVIDER_LOCAL,
@@ -66,8 +71,20 @@ def build_agent(
 
     model = options.get(CONF_MODEL, OPTION_DEFAULTS[CONF_MODEL])
     max_tokens = options.get(CONF_MAX_TOKENS, OPTION_DEFAULTS[CONF_MAX_TOKENS])
+    try:
+        extra_headers = parse_extra_headers(data.get(CONF_EXTRA_HEADERS, ""))
+    except ValueError:
+        # Validated at config time; a corrupt stored value must not brick setup.
+        extra_headers = {}
     provider = AnthropicProvider(
-        session, data[CONF_API_KEY], model=model, max_tokens=max_tokens
+        session,
+        data[CONF_API_KEY],
+        model=model,
+        max_tokens=max_tokens,
+        base_url=str(data.get(CONF_BASE_URL, "") or ""),
+        credential_kind=data.get(CONF_CREDENTIAL_KIND, CREDENTIAL_KIND_X_API_KEY),
+        credential_header=str(data.get(CONF_CREDENTIAL_HEADER, "") or ""),
+        extra_headers=extra_headers,
     )
     return AgentLoop(provider, model=model, tool_runner=tool_runner, tools=tools)
 
