@@ -12,7 +12,10 @@
  * any two versions (list_versions, get_version with diff_against, SPEC §12),
  * advisory-only stale findings (stale_advisories, SPEC §13), and a pattern
  * suggestions inbox (list_suggestions, accept_suggestion, dismiss_suggestion,
- * SPEC §11). All text is escaped before rendering.
+ * SPEC §11), plus a provider Settings drawer (provider_settings,
+ * update_provider_settings, test_connection, list_models, SPEC §8) — the
+ * stored API key and extra-header values are never sent to the browser.
+ * All text is escaped before rendering.
  */
 
 const esc = (s) =>
@@ -35,6 +38,25 @@ const diffClass = (line) => {
   return "ctx";
 };
 
+// Panel-side messages for the WS settings-update error keys (SPEC §8).
+const SETTINGS_ERRORS = {
+  invalid_base_url: "Enter the custom endpoint as an http(s) URL.",
+  cleartext_remote_base_url:
+    "Cleartext http is only allowed for local endpoints; use https.",
+  credential_header_required:
+    "The custom_header credential kind needs a header name.",
+  invalid_extra_headers:
+    'Extra headers must be one "Name: value" per line; credential and protocol headers are not allowed.',
+  api_key_required: "An API key is required for this credential kind.",
+  invalid_credential_kind: "Unknown credential kind.",
+  invalid_max_tokens: "Max tokens must be a positive number.",
+  invalid_host: "Enter the local backend as an http(s) URL.",
+  cleartext_remote_host:
+    "Cleartext http is only allowed for local hosts; use https.",
+};
+
+const CREDENTIAL_KINDS = ["x-api-key", "bearer", "custom_header", "none"];
+
 class DigiSparkAgentPanel extends HTMLElement {
   constructor() {
     super();
@@ -45,6 +67,12 @@ class DigiSparkAgentPanel extends HTMLElement {
     this._scannedAt = "";
     this._suggestions = [];
     this._suggScannedAt = "";
+    this._settings = null;
+    this._settingsOpen = false;
+    this._settingsModels = [];
+    this._settingsError = "";
+    this._settingsNotice = "";
+    this._testResult = null;
     this._versions = [];
     this._historyFor = null;
     this._diffLines = null;
@@ -158,6 +186,204 @@ class DigiSparkAgentPanel extends HTMLElement {
     }
     this._renderMessages();
     this._refreshReview();
+  }
+
+  async _loadSettings() {
+    if (!this._hass) return;
+    try {
+      const res = await this._ws({ type: "digispark_ha_agent/provider_settings" });
+      this._settings = (res && res.settings) || null;
+    } catch (_err) {
+      this._settings = null;
+    }
+    this._settingsModels = [];
+    this._settingsError = "";
+    this._settingsNotice = "";
+    this._testResult = null;
+    this._renderSettings(null);
+  }
+
+  _readSettingsForm() {
+    const val = (id) => {
+      const el = this.shadowRoot.getElementById(id);
+      return el ? el.value : "";
+    };
+    const checked = (id) => {
+      const el = this.shadowRoot.getElementById(id);
+      return !!(el && el.checked);
+    };
+    return {
+      base_url: val("set-base-url").trim(),
+      credential_kind: val("set-cred-kind"),
+      credential_header: val("set-cred-header").trim(),
+      api_key: val("set-api-key"),
+      extra_headers: val("set-headers"),
+      clear_headers: checked("set-clear-headers"),
+      model: val("set-model").trim(),
+      max_tokens: val("set-max-tokens"),
+      host: val("set-host").trim(),
+      chat_probe: checked("set-test-chat"),
+    };
+  }
+
+  async _saveSettings() {
+    const form = this._readSettingsForm();
+    const updates = {
+      base_url: form.base_url,
+      credential_kind: form.credential_kind,
+      credential_header: form.credential_header,
+      model: form.model,
+      max_tokens: form.max_tokens,
+    };
+    if (this._settings && this._settings.provider === "local")
+      updates.host = form.host;
+    if (form.api_key.trim()) updates.api_key = form.api_key;
+    if (form.clear_headers) updates.extra_headers = "";
+    else if (form.extra_headers.trim()) updates.extra_headers = form.extra_headers;
+    try {
+      const res = await this._ws({
+        type: "digispark_ha_agent/update_provider_settings",
+        settings: updates,
+      });
+      if (res && res.success) {
+        this._settings = res.settings;
+        this._settingsError = "";
+        this._settingsNotice = "Saved. The agent reloaded with the new settings.";
+        this._testResult = null;
+        this._renderSettings(null);
+      } else {
+        const key = (res && res.error) || "";
+        this._settingsError = SETTINGS_ERRORS[key] || key || "Save failed";
+        this._settingsNotice = "";
+        this._renderSettings(form);
+      }
+    } catch (err) {
+      this._settingsError = (err && err.message) || "Save failed";
+      this._settingsNotice = "";
+      this._renderSettings(form);
+    }
+  }
+
+  async _fetchSettingsModels() {
+    const form = this._readSettingsForm();
+    try {
+      const res = await this._ws({ type: "digispark_ha_agent/list_models" });
+      if (res && res.success) {
+        this._settingsModels = res.models || [];
+        this._settingsError = "";
+        this._settingsNotice = `Fetched ${this._settingsModels.length} model(s).`;
+      } else {
+        this._settingsError =
+          (res && (res.hint || res.message)) || "Model fetch failed";
+        this._settingsNotice = "";
+      }
+    } catch (err) {
+      this._settingsError = (err && err.message) || "Model fetch failed";
+      this._settingsNotice = "";
+    }
+    this._renderSettings(form);
+  }
+
+  async _testSettingsConnection() {
+    const form = this._readSettingsForm();
+    try {
+      this._testResult = await this._ws({
+        type: "digispark_ha_agent/test_connection",
+        chat: form.chat_probe,
+      });
+    } catch (err) {
+      this._testResult = {
+        success: false,
+        list_models: {
+          success: false,
+          message: (err && err.message) || "Test failed",
+          hint: "",
+        },
+        chat: null,
+      };
+    }
+    this._settingsError = "";
+    this._settingsNotice = "";
+    this._renderSettings(form);
+  }
+
+  _renderSettings(form) {
+    if (!this._settingsBox) return;
+    const s = this._settings;
+    if (!s) {
+      this._settingsBox.innerHTML = `<div class="none">No configured entry.</div>`;
+      return;
+    }
+    const v = (formValue, saved) => esc(form ? formValue : saved);
+    const kindNow = form ? form.credential_kind : s.credential_kind;
+    const kindOptions = CREDENTIAL_KINDS.map(
+      (k) =>
+        `<option value="${esc(k)}"${k === kindNow ? " selected" : ""}>${esc(k)}</option>`,
+    ).join("");
+    const modelNow = String(form ? form.model : s.model);
+    let modelField;
+    if (this._settingsModels.length) {
+      const opts = [...this._settingsModels];
+      if (modelNow && !opts.includes(modelNow)) opts.push(modelNow);
+      modelField = `<select id="set-model">${opts
+        .map(
+          (m) =>
+            `<option value="${esc(m)}"${m === modelNow ? " selected" : ""}>${esc(m)}</option>`,
+        )
+        .join("")}</select>`;
+    } else {
+      modelField = `<input id="set-model" type="text" value="${esc(modelNow)}" />`;
+    }
+    const hostField =
+      s.provider === "local"
+        ? `<div class="field"><label>Local backend URL</label>
+            <input id="set-host" type="text" value="${v(form && form.host, s.host)}" /></div>`
+        : "";
+    const keyStatus = s.has_api_key ? "configured" : "not set";
+    const maskedNote = s.extra_headers_masked
+      ? ` Current: ${esc(s.extra_headers_masked).replaceAll("\n", ", ")}.`
+      : "";
+    this._settingsBox.innerHTML = `
+      <h3>Provider settings <span class="badge">${esc(s.provider)}</span></h3>
+      ${hostField}
+      <div class="field"><label>Custom endpoint base URL (Anthropic-compatible; empty = api.anthropic.com)</label>
+        <input id="set-base-url" type="text" value="${v(form && form.base_url, s.base_url)}" /></div>
+      <div class="field"><label>Credential kind</label>
+        <select id="set-cred-kind">${kindOptions}</select></div>
+      <div class="field"><label>Credential header name (custom_header kind only)</label>
+        <input id="set-cred-header" type="text" value="${v(form && form.credential_header, s.credential_header)}" /></div>
+      <div class="field"><label>API key (${esc(keyStatus)} — leave blank to keep)</label>
+        <input id="set-api-key" type="password" value="" autocomplete="off" /></div>
+      <div class="field"><label>Extra inference headers, one "Name: value" per line (blank = keep current).${maskedNote}</label>
+        <textarea id="set-headers" rows="2">${form ? esc(form.extra_headers) : ""}</textarea>
+        <label><input id="set-clear-headers" type="checkbox"${form && form.clear_headers ? " checked" : ""} /> Clear all extra headers</label></div>
+      <div class="field"><label>Model</label>${modelField}</div>
+      <div class="field"><label>Max output tokens</label>
+        <input id="set-max-tokens" type="number" min="1" value="${v(form && form.max_tokens, s.max_tokens)}" /></div>
+      <div class="row">
+        <span class="what"><label><input id="set-test-chat" type="checkbox"${form && form.chat_probe ? " checked" : ""} /> Include one-token chat probe</label></span>
+        <button class="ghost" data-settings="fetch-models">Fetch models</button>
+        <button class="ghost" data-settings="test">Test connection</button>
+        <button data-settings="save">Save</button>
+      </div>
+      <div class="none">Fetch and Test use the saved settings, not unsaved edits.</div>
+      ${this._settingsResultHtml()}`;
+  }
+
+  _settingsResultHtml() {
+    let html = "";
+    if (this._settingsError)
+      html += `<div class="advice"><span class="result-bad">${esc(this._settingsError)}</span></div>`;
+    if (this._settingsNotice)
+      html += `<div class="advice"><span class="result-ok">${esc(this._settingsNotice)}</span></div>`;
+    const t = this._testResult;
+    if (t && t.list_models) {
+      const line = (r) =>
+        `<span class="${r.success ? "result-ok" : "result-bad"}">${r.success ? "OK" : "FAILED"} — ${esc(r.message)}</span>${r.hint ? ` <span class="detail">${esc(r.hint)}</span>` : ""}`;
+      html += `<div class="advice">Models: ${line(t.list_models)}</div>`;
+      if (t.chat) html += `<div class="advice">Chat: ${line(t.chat)}</div>`;
+    }
+    return html;
   }
 
   async _loadHistory(automationId) {
@@ -324,13 +550,21 @@ class DigiSparkAgentPanel extends HTMLElement {
         .advice { padding: 6px 16px; }
         .advice .detail { color: var(--secondary-text-color, #727272); }
         .none { padding: 4px 16px 8px; color: var(--secondary-text-color, #727272); }
+        .field { display: flex; flex-direction: column; gap: 2px; padding: 6px 16px; }
+        .field label { font-size: 12px; color: var(--secondary-text-color, #727272); }
+        .field input, .field select, .field textarea { padding: 8px 10px; border-radius: 8px; border: 1px solid var(--divider-color, #e0e0e0); background: var(--primary-background-color, #fafafa); color: var(--primary-text-color, #212121); font-size: 13px; }
+        .field input[type="checkbox"] { flex: none; padding: 0; }
+        .result-ok { color: #2e7d32; }
+        .result-bad { color: #c62828; }
       </style>
       <div class="wrap">
         <div class="log" id="log"></div>
         <div class="review" id="review" hidden></div>
+        <div class="review" id="settings" hidden></div>
         <div class="pending" id="pending"></div>
         <form class="bar" id="form">
           <input id="input" type="text" placeholder="Ask your home…" autocomplete="off" />
+          <button id="settings-toggle" type="button">Settings</button>
           <button id="review-toggle" type="button">Review</button>
           <button id="send" type="submit">Send</button>
         </form>
@@ -358,10 +592,33 @@ class DigiSparkAgentPanel extends HTMLElement {
         this._actOnSuggestion(act, id);
       else if (act === "sugg-rescan") this._rescanSuggestions();
     });
+    this._settingsBox = this.shadowRoot.getElementById("settings");
+    this._settingsToggle = this.shadowRoot.getElementById("settings-toggle");
+    this._settingsBox.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-settings]");
+      if (!btn) return;
+      const act = btn.dataset.settings;
+      if (act === "save") this._saveSettings();
+      else if (act === "test") this._testSettingsConnection();
+      else if (act === "fetch-models") this._fetchSettingsModels();
+    });
+    this._settingsToggle.addEventListener("click", () => {
+      this._settingsOpen = !this._settingsOpen;
+      this._settingsBox.hidden = !this._settingsOpen;
+      if (this._settingsOpen) {
+        this._reviewOpen = false;
+        this._reviewBox.hidden = true;
+        this._loadSettings();
+      }
+    });
     this._reviewToggle.addEventListener("click", () => {
       this._reviewOpen = !this._reviewOpen;
       this._reviewBox.hidden = !this._reviewOpen;
-      if (this._reviewOpen) this._refreshReview();
+      if (this._reviewOpen) {
+        this._settingsOpen = false;
+        this._settingsBox.hidden = true;
+        this._refreshReview();
+      }
     });
     this.shadowRoot.getElementById("form").addEventListener("submit", (ev) => {
       ev.preventDefault();
