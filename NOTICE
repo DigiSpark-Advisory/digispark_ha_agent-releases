@@ -1,0 +1,32 @@
+DigiSpark HA Agent
+Copyright (c) 2026 DigiSpark Advisory LLC. All rights reserved.
+
+This product is an independent, clean-room implementation. It was written from a
+functional specification (see SPEC.md) and does not incorporate source code,
+comments, structure, or other copyrightable expression from any third-party
+project.
+
+The Software targets the following public interfaces, which remain the property
+of their respective owners and are used only through their documented public
+APIs:
+
+  - Home Assistant (integration, config-flow, WebSocket, and entity/service
+    APIs) - Home Assistant / Open Home Foundation.
+  - Anthropic Claude API - Anthropic PBC.
+  - (Future) OpenAI, Google Gemini, and Ollama / OpenAI-compatible APIs -
+    their respective owners.
+
+Optional bundled/at-runtime model (permissive dependency):
+
+  - Selora AI model weights, LoRA adapters, Modelfiles, and system prompts
+    (huggingface.co/selorahomes/Selora-AI) - licensed Apache-2.0. Base model
+    Qwen3-1.7B (Qwen / Alibaba) - Apache-2.0. If these artifacts are distributed
+    with or by this product, their Apache-2.0 license and this attribution are
+    retained, and modifications are stated, as Apache-2.0 requires. This does not
+    grant any right to the separate, proprietary ha-selora-ai integration.
+
+Trademarks and product names are the property of their respective owners and are
+referenced for identification and interoperability only. Their mention does not
+imply endorsement.
+
+See PROVENANCE.md for the clean-room methodology and reference boundaries.
