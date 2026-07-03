@@ -26,15 +26,25 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .config_schema import (
     OPTION_DEFAULTS,
     build_options,
+    extra_headers_problem,
     model_choices,
+    parse_extra_headers,
     split_create_input,
 )
 from .const import (
     CONF_API_KEY,
+    CONF_BASE_URL,
+    CONF_CREDENTIAL_HEADER,
+    CONF_CREDENTIAL_KIND,
+    CONF_EXTRA_HEADERS,
     CONF_HOST,
     CONF_MAX_TOKENS,
     CONF_MODEL,
     CONF_PROVIDER,
+    CREDENTIAL_KIND_CUSTOM,
+    CREDENTIAL_KIND_NONE,
+    CREDENTIAL_KIND_X_API_KEY,
+    CREDENTIAL_KINDS,
     DEFAULT_LOCAL_HOST,
     DEFAULT_MODEL,
     DOMAIN,
@@ -53,6 +63,13 @@ _LOGGER = logging.getLogger(__name__)
 
 _TITLE = "DigiSpark HA Agent"
 
+# host_problem() speaks in local-backend error keys; the endpoint field has
+# its own strings so the form message names the right field (SPEC.md §2.2).
+_BASE_URL_ERRORS = {
+    "invalid_host": "invalid_base_url",
+    "cleartext_remote_host": "cleartext_remote_base_url",
+}
+
 
 async def _fetch_models(hass: HomeAssistant, connection: dict) -> list[str]:
     """The provider's model ids, or [] when they cannot be fetched.
@@ -69,7 +86,17 @@ async def _fetch_models(hass: HomeAssistant, connection: dict) -> list[str]:
             )
         else:
             provider = AnthropicProvider(
-                session, str(connection.get(CONF_API_KEY, "")), model=DEFAULT_MODEL
+                session,
+                str(connection.get(CONF_API_KEY, "")),
+                model=DEFAULT_MODEL,
+                base_url=str(connection.get(CONF_BASE_URL, "") or ""),
+                credential_kind=connection.get(
+                    CONF_CREDENTIAL_KIND, CREDENTIAL_KIND_X_API_KEY
+                ),
+                credential_header=str(connection.get(CONF_CREDENTIAL_HEADER, "") or ""),
+                extra_headers=parse_extra_headers(
+                    connection.get(CONF_EXTRA_HEADERS, "")
+                ),
             )
         async with asyncio.timeout(MODEL_FETCH_TIMEOUT_SECONDS):
             models = await provider.list_models()
@@ -115,6 +142,15 @@ def _create_schema() -> vol.Schema:
             # step handler because voluptuous sees one field at a time.
             vol.Optional(CONF_API_KEY, default=""): str,
             vol.Optional(CONF_HOST, default=DEFAULT_LOCAL_HOST): str,
+            # Custom Anthropic-compatible endpoint (SPEC.md §2.2): optional
+            # gateway/proxy base URL, pluggable credential header, and extra
+            # per-request headers ("Name: value" per line).
+            vol.Optional(CONF_BASE_URL, default=""): str,
+            vol.Optional(
+                CONF_CREDENTIAL_KIND, default=CREDENTIAL_KIND_X_API_KEY
+            ): vol.In(list(CREDENTIAL_KINDS)),
+            vol.Optional(CONF_CREDENTIAL_HEADER, default=""): str,
+            vol.Optional(CONF_EXTRA_HEADERS, default=""): str,
         }
     )
 
@@ -127,7 +163,22 @@ def _create_errors(user_input: dict) -> dict[str, str]:
         if problem:
             return {"base": problem}
         return {}
-    if not str(user_input.get(CONF_API_KEY, "")).strip():
+    base_url = str(user_input.get(CONF_BASE_URL, "")).strip()
+    if base_url:
+        problem = host_problem(base_url)
+        if problem:
+            return {"base": _BASE_URL_ERRORS.get(problem, problem)}
+    kind = user_input.get(CONF_CREDENTIAL_KIND, CREDENTIAL_KIND_X_API_KEY)
+    header_name = str(user_input.get(CONF_CREDENTIAL_HEADER, "")).strip()
+    if kind == CREDENTIAL_KIND_CUSTOM and not header_name:
+        return {"base": "credential_header_required"}
+    headers_problem = extra_headers_problem(user_input.get(CONF_EXTRA_HEADERS, ""))
+    if headers_problem:
+        return {"base": headers_problem}
+    if (
+        kind != CREDENTIAL_KIND_NONE
+        and not str(user_input.get(CONF_API_KEY, "")).strip()
+    ):
         return {"base": "api_key_required"}
     return {}
 

@@ -17,8 +17,16 @@ import logging
 
 import aiohttp
 
-from ..const import DEFAULT_MAX_TOKENS, PROVIDER_TIMEOUT_SECONDS
+from ..const import (
+    CREDENTIAL_KIND_BEARER,
+    CREDENTIAL_KIND_CUSTOM,
+    CREDENTIAL_KIND_X_API_KEY,
+    CREDENTIAL_KINDS,
+    DEFAULT_MAX_TOKENS,
+    PROVIDER_TIMEOUT_SECONDS,
+)
 from .base import ChatResult, NonRetryableError, Provider, ToolCall
+from .local import host_problem
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +36,12 @@ API_BASE = "https://api.anthropic.com"
 MESSAGES_ENDPOINT = f"{API_BASE}/v1/messages"
 MODELS_ENDPOINT = f"{API_BASE}/v1/models"
 ANTHROPIC_VERSION = "2023-06-01"
+
+# Headers the integration manages itself; free-form extra headers may never
+# carry credentials or override the protocol headers (SPEC §2.2).
+_RESERVED_HEADERS = frozenset(
+    {"x-api-key", "authorization", "anthropic-version", "content-type"}
+)
 
 # Transient-failure retry policy. 4xx (except 429) never retries (SPEC §2).
 DEFAULT_MAX_RETRIES = 2
@@ -47,20 +61,51 @@ class AnthropicProvider(Provider):
         model: str,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        base_url: str = "",
+        credential_kind: str = CREDENTIAL_KIND_X_API_KEY,
+        credential_header: str = "",
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self._session = session
         self._api_key = api_key
         self._model = model
         self._max_tokens = max_tokens
         self._max_retries = max_retries
+        base = str(base_url or "").strip().rstrip("/")
+        if base:
+            problem = host_problem(base)
+            if problem:
+                raise ValueError(f"invalid endpoint base URL: {problem}")
+        self._base_url = base or API_BASE
+        self._messages_url = f"{self._base_url}/v1/messages"
+        self._models_url = f"{self._base_url}/v1/models"
+        if credential_kind not in CREDENTIAL_KINDS:
+            raise ValueError(f"unknown credential kind {credential_kind!r}")
+        header_name = str(credential_header or "").strip()
+        if credential_kind == CREDENTIAL_KIND_CUSTOM and not header_name:
+            raise ValueError("the custom_header credential kind needs a header name")
+        self._credential_kind = credential_kind
+        self._credential_header = header_name
+        extras = {str(k).strip(): str(v) for k, v in (extra_headers or {}).items()}
+        for name in extras:
+            if name.lower() in _RESERVED_HEADERS:
+                raise ValueError(f"extra header {name!r} is reserved")
+        self._extra_headers = extras
 
     @property
     def _headers(self) -> dict[str, str]:
-        return {
-            "x-api-key": self._api_key,
+        headers = {
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
+        headers.update(self._extra_headers)
+        if self._credential_kind == CREDENTIAL_KIND_X_API_KEY:
+            headers["x-api-key"] = self._api_key
+        elif self._credential_kind == CREDENTIAL_KIND_BEARER:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        elif self._credential_kind == CREDENTIAL_KIND_CUSTOM:
+            headers[self._credential_header] = self._api_key
+        return headers
 
     async def chat(
         self,
@@ -87,7 +132,7 @@ class AnthropicProvider(Provider):
         if tools:
             payload["tools"] = tools
 
-        data = await self._request("POST", MESSAGES_ENDPOINT, json=payload)
+        data = await self._request("POST", self._messages_url, json=payload)
         return ChatResult(
             text=_extract_text(data),
             raw=data,
@@ -101,14 +146,14 @@ class AnthropicProvider(Provider):
 
     async def list_models(self) -> list[str]:
         """Return selectable model IDs from the Anthropic models endpoint."""
-        data = await self._request("GET", MODELS_ENDPOINT)
+        data = await self._request("GET", self._models_url)
         entries = data.get("data", []) if isinstance(data, dict) else []
         return [m["id"] for m in entries if isinstance(m, dict) and "id" in m]
 
     async def health_check(self) -> bool:
         """Return True if the backend is reachable and the key authenticates."""
         try:
-            await self._request("GET", MODELS_ENDPOINT)
+            await self._request("GET", self._models_url)
         except NonRetryableError:
             # Auth failure / bad request: reachable but not usable.
             return False
