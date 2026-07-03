@@ -24,12 +24,16 @@ from ..ha_bridge import (
     async_accept_suggestion,
     async_discard_draft,
     async_dismiss_suggestion,
+    async_get_provider_settings,
     async_get_version,
     async_list_drafts,
+    async_list_provider_models,
     async_list_suggestions,
     async_list_versions,
     async_rollback,
     async_stale_advisories,
+    async_test_provider_connection,
+    async_update_provider_settings,
 )
 from ..patterns.suggestions import SuggestionStoreError
 from ..runtime import chat_response, history_response
@@ -65,6 +69,10 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_list_suggestions)
     websocket_api.async_register_command(hass, websocket_dismiss_suggestion)
     websocket_api.async_register_command(hass, websocket_accept_suggestion)
+    websocket_api.async_register_command(hass, websocket_provider_settings)
+    websocket_api.async_register_command(hass, websocket_update_provider_settings)
+    websocket_api.async_register_command(hass, websocket_test_connection)
+    websocket_api.async_register_command(hass, websocket_list_provider_models)
     domain_data[_WS_REGISTERED] = True
 
 
@@ -455,5 +463,95 @@ async def websocket_accept_suggestion(
         )
     except (AutomationWriteError, SuggestionStoreError) as err:
         connection.send_error(msg["id"], "suggestions_failed", str(err))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "digispark_ha_agent/provider_settings",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_provider_settings(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """Return the entry's provider settings, redacted (SPEC.md §8)."""
+    result = await async_get_provider_settings(hass, entry_id=msg.get("entry_id"))
+    if result is None:
+        connection.send_error(
+            msg["id"], "not_found", "No configured DigiSpark HA Agent entry"
+        )
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "digispark_ha_agent/update_provider_settings",
+        vol.Required("settings"): dict,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_update_provider_settings(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """Validate and persist a partial settings update (SPEC.md §8)."""
+    result = await async_update_provider_settings(
+        hass, msg["settings"], entry_id=msg.get("entry_id")
+    )
+    if result is None:
+        connection.send_error(
+            msg["id"], "not_found", "No configured DigiSpark HA Agent entry"
+        )
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "digispark_ha_agent/test_connection",
+        vol.Optional("chat"): bool,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_test_connection(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """Model-list probe plus optional one-token chat probe (SPEC.md §8)."""
+    result = await async_test_provider_connection(
+        hass, entry_id=msg.get("entry_id"), chat=msg.get("chat", False)
+    )
+    if result is None:
+        connection.send_error(
+            msg["id"], "not_found", "No configured DigiSpark HA Agent entry"
+        )
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "digispark_ha_agent/list_models",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_list_provider_models(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """Live model list using the stored credentials (SPEC.md §8)."""
+    result = await async_list_provider_models(hass, entry_id=msg.get("entry_id"))
+    if result is None:
+        connection.send_error(
+            msg["id"], "not_found", "No configured DigiSpark HA Agent entry"
+        )
         return
     connection.send_result(msg["id"], result)

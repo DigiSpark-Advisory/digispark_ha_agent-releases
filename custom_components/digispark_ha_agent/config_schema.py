@@ -25,12 +25,17 @@ from .const import (
     CONF_MAX_TOKENS,
     CONF_MODEL,
     CONF_PROVIDER,
+    CREDENTIAL_KIND_CUSTOM,
+    CREDENTIAL_KIND_NONE,
     CREDENTIAL_KIND_X_API_KEY,
+    CREDENTIAL_KINDS,
     DEFAULT_LOCAL_HOST,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     PROVIDER_ANTHROPIC,
+    PROVIDER_LOCAL,
 )
+from .providers.local import host_problem
 
 # Every field presented on the create form.
 FORM_FIELDS: tuple[str, ...] = (
@@ -150,3 +155,114 @@ def model_choices(fetched: list[str], current: str) -> list[str]:
         if model and model not in choices:
             choices.append(model)
     return choices
+
+
+# -- provider-settings editing (SPEC.md §8; shared by the create form and WS) ----
+
+# host_problem() speaks in local-backend error keys; the endpoint field has its
+# own keys so the message names the right field (SPEC.md §2.2).
+_BASE_URL_ERRORS = {
+    "invalid_host": "invalid_base_url",
+    "cleartext_remote_host": "cleartext_remote_base_url",
+}
+
+# Connection fields the WS settings update may change. The provider id is
+# fixed at create — switching provider families means a new entry.
+UPDATABLE_DATA_FIELDS: tuple[str, ...] = (
+    CONF_API_KEY,
+    CONF_HOST,
+    CONF_BASE_URL,
+    CONF_CREDENTIAL_KIND,
+    CONF_CREDENTIAL_HEADER,
+    CONF_EXTRA_HEADERS,
+)
+
+
+def connection_problem(merged: dict) -> str | None:
+    """Error key for a full connection mapping, or None when it is valid.
+
+    Single source of truth: the create form and the WS settings update both
+    validate through here, so the rules cannot drift between the two paths.
+    """
+    provider = merged.get(CONF_PROVIDER, PROVIDER_ANTHROPIC)
+    if provider == PROVIDER_LOCAL:
+        return host_problem(str(merged.get(CONF_HOST, "")))
+    base_url = str(merged.get(CONF_BASE_URL, "") or "").strip()
+    if base_url:
+        problem = host_problem(base_url)
+        if problem:
+            return _BASE_URL_ERRORS.get(problem, problem)
+    kind = merged.get(CONF_CREDENTIAL_KIND, CREDENTIAL_KIND_X_API_KEY)
+    if kind not in CREDENTIAL_KINDS:
+        return "invalid_credential_kind"
+    header_name = str(merged.get(CONF_CREDENTIAL_HEADER, "") or "").strip()
+    if kind == CREDENTIAL_KIND_CUSTOM and not header_name:
+        return "credential_header_required"
+    problem = extra_headers_problem(merged.get(CONF_EXTRA_HEADERS, ""))
+    if problem:
+        return problem
+    if (
+        kind != CREDENTIAL_KIND_NONE
+        and not str(merged.get(CONF_API_KEY, "") or "").strip()
+    ):
+        return "api_key_required"
+    return None
+
+
+def redacted_settings(data: dict, options: dict) -> dict:
+    """Provider settings safe to send to the panel: secrets never leave.
+
+    The API key is reduced to ``has_api_key``. Extra-header values are masked
+    (names stay visible so the admin can see what is configured); on update
+    the whole field is replaced, never edited line-by-line.
+    """
+    try:
+        parsed = parse_extra_headers(data.get(CONF_EXTRA_HEADERS, ""))
+    except ValueError:
+        parsed = {}
+    masked = "\n".join(f"{name}: ***" for name in parsed)
+    return {
+        CONF_PROVIDER: data.get(CONF_PROVIDER, PROVIDER_ANTHROPIC),
+        CONF_HOST: data.get(CONF_HOST, DEFAULT_LOCAL_HOST),
+        CONF_BASE_URL: data.get(CONF_BASE_URL, ""),
+        CONF_CREDENTIAL_KIND: data.get(CONF_CREDENTIAL_KIND, CREDENTIAL_KIND_X_API_KEY),
+        CONF_CREDENTIAL_HEADER: data.get(CONF_CREDENTIAL_HEADER, ""),
+        "extra_headers_masked": masked,
+        "has_api_key": bool(str(data.get(CONF_API_KEY, "") or "").strip()),
+        CONF_MODEL: options.get(CONF_MODEL, DEFAULT_MODEL),
+        CONF_MAX_TOKENS: options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS),
+    }
+
+
+def merge_settings(
+    data: dict, options: dict, updates: dict
+) -> tuple[dict, dict, str | None]:
+    """Apply a partial settings update; returns (data, options, problem).
+
+    Absent fields keep their current values. The API key follows
+    leave-blank-keeps-current: absent, None, or an empty string means keep the
+    stored key. On any problem the ORIGINAL mappings are returned unchanged.
+    """
+    new_data = dict(data)
+    new_options = dict(options)
+    for field in UPDATABLE_DATA_FIELDS:
+        if field not in updates:
+            continue
+        value = updates[field]
+        if field == CONF_API_KEY and not str(value or "").strip():
+            continue  # leave blank to keep the stored key
+        new_data[field] = "" if value is None else str(value)
+    if CONF_MODEL in updates and str(updates[CONF_MODEL] or "").strip():
+        new_options[CONF_MODEL] = str(updates[CONF_MODEL]).strip()
+    if CONF_MAX_TOKENS in updates:
+        try:
+            tokens = int(updates[CONF_MAX_TOKENS])
+        except (TypeError, ValueError):
+            return data, options, "invalid_max_tokens"
+        if tokens < 1:
+            return data, options, "invalid_max_tokens"
+        new_options[CONF_MAX_TOKENS] = tokens
+    problem = connection_problem(new_data)
+    if problem:
+        return data, options, problem
+    return new_data, new_options, None

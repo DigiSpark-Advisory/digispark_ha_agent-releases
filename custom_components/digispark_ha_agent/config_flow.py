@@ -26,7 +26,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .config_schema import (
     OPTION_DEFAULTS,
     build_options,
-    extra_headers_problem,
+    connection_problem,
     model_choices,
     parse_extra_headers,
     split_create_input,
@@ -41,8 +41,6 @@ from .const import (
     CONF_MAX_TOKENS,
     CONF_MODEL,
     CONF_PROVIDER,
-    CREDENTIAL_KIND_CUSTOM,
-    CREDENTIAL_KIND_NONE,
     CREDENTIAL_KIND_X_API_KEY,
     CREDENTIAL_KINDS,
     DEFAULT_LOCAL_HOST,
@@ -54,7 +52,7 @@ from .const import (
     SUPPORTED_PROVIDERS,
 )
 from .providers.anthropic import AnthropicProvider
-from .providers.local import LocalProvider, host_problem
+from .providers.local import LocalProvider
 
 if TYPE_CHECKING:
     from homeassistant.data_entry_flow import FlowResult
@@ -62,13 +60,6 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 _TITLE = "DigiSpark HA Agent"
-
-# host_problem() speaks in local-backend error keys; the endpoint field has
-# its own strings so the form message names the right field (SPEC.md §2.2).
-_BASE_URL_ERRORS = {
-    "invalid_host": "invalid_base_url",
-    "cleartext_remote_host": "cleartext_remote_base_url",
-}
 
 
 async def _fetch_models(hass: HomeAssistant, connection: dict) -> list[str]:
@@ -156,31 +147,13 @@ def _create_schema() -> vol.Schema:
 
 
 def _create_errors(user_input: dict) -> dict[str, str]:
-    """Cross-field validation for the create form (SPEC.md §8)."""
-    provider = user_input.get(CONF_PROVIDER, PROVIDER_ANTHROPIC)
-    if provider == PROVIDER_LOCAL:
-        problem = host_problem(str(user_input.get(CONF_HOST, "")))
-        if problem:
-            return {"base": problem}
-        return {}
-    base_url = str(user_input.get(CONF_BASE_URL, "")).strip()
-    if base_url:
-        problem = host_problem(base_url)
-        if problem:
-            return {"base": _BASE_URL_ERRORS.get(problem, problem)}
-    kind = user_input.get(CONF_CREDENTIAL_KIND, CREDENTIAL_KIND_X_API_KEY)
-    header_name = str(user_input.get(CONF_CREDENTIAL_HEADER, "")).strip()
-    if kind == CREDENTIAL_KIND_CUSTOM and not header_name:
-        return {"base": "credential_header_required"}
-    headers_problem = extra_headers_problem(user_input.get(CONF_EXTRA_HEADERS, ""))
-    if headers_problem:
-        return {"base": headers_problem}
-    if (
-        kind != CREDENTIAL_KIND_NONE
-        and not str(user_input.get(CONF_API_KEY, "")).strip()
-    ):
-        return {"base": "api_key_required"}
-    return {}
+    """Cross-field validation for the create form (SPEC.md §8).
+
+    Delegates to config_schema.connection_problem — the same rules the WS
+    settings update uses, so the two write paths cannot drift.
+    """
+    problem = connection_problem(user_input)
+    return {"base": problem} if problem else {}
 
 
 def _options_schema(current: dict, models: list[str]) -> vol.Schema:

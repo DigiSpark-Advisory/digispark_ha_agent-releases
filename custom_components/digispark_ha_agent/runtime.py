@@ -58,25 +58,44 @@ def build_agent(
     loop; both default to None so a tool-less agent still works.
     """
     provider_id = data.get(CONF_PROVIDER, PROVIDER_ANTHROPIC)
+    provider = build_provider(session, data, options)
 
     if provider_id == PROVIDER_LOCAL:
-        host = data.get(CONF_HOST) or DEFAULT_LOCAL_HOST
-        provider = LocalProvider(session, host)
         # The local path executes envelope actions through the guarded
         # runner; the generic tool protocol is not used (SPEC §2.1).
         return LocalAgentLoop(provider, tool_runner=tool_runner)
 
+    model = options.get(CONF_MODEL, OPTION_DEFAULTS[CONF_MODEL])
+    return AgentLoop(provider, model=model, tool_runner=tool_runner, tools=tools)
+
+
+def build_provider(
+    session: aiohttp.ClientSession,
+    data: dict,
+    options: dict,
+    *,
+    max_tokens_override: int | None = None,
+):
+    """The configured provider for an entry (SPEC.md §2, §8).
+
+    Shared by the agent loop and the WS connection-test path;
+    ``max_tokens_override`` lets the probe cap a chat test at one token.
+    """
+    provider_id = data.get(CONF_PROVIDER, PROVIDER_ANTHROPIC)
+    if provider_id == PROVIDER_LOCAL:
+        return LocalProvider(session, data.get(CONF_HOST) or DEFAULT_LOCAL_HOST)
     if provider_id != PROVIDER_ANTHROPIC:
         raise UnsupportedProviderError(provider_id)
-
     model = options.get(CONF_MODEL, OPTION_DEFAULTS[CONF_MODEL])
-    max_tokens = options.get(CONF_MAX_TOKENS, OPTION_DEFAULTS[CONF_MAX_TOKENS])
+    max_tokens = max_tokens_override or options.get(
+        CONF_MAX_TOKENS, OPTION_DEFAULTS[CONF_MAX_TOKENS]
+    )
     try:
         extra_headers = parse_extra_headers(data.get(CONF_EXTRA_HEADERS, ""))
     except ValueError:
         # Validated at config time; a corrupt stored value must not brick setup.
         extra_headers = {}
-    provider = AnthropicProvider(
+    return AnthropicProvider(
         session,
         data[CONF_API_KEY],
         model=model,
@@ -86,7 +105,71 @@ def build_agent(
         credential_header=str(data.get(CONF_CREDENTIAL_HEADER, "") or ""),
         extra_headers=extra_headers,
     )
-    return AgentLoop(provider, model=model, tool_runner=tool_runner, tools=tools)
+
+
+# Friendly hints for the panel keyed on status codes in provider error text.
+_HINTS: tuple[tuple[str, str], ...] = (
+    (" 401", "The endpoint rejected the credentials (401). Check the API key."),
+    (" 403", "The endpoint refused access (403). Check the key's permissions."),
+    (" 404", "Not found (404). Check the base URL."),
+    (" 429", "Rate limited (429). Try again shortly."),
+)
+
+
+def friendly_hint(message: str) -> str:
+    """A short human hint for a provider error message, or an empty string."""
+    for token, hint in _HINTS:
+        if token in message:
+            return hint
+    return ""
+
+
+async def probe_provider(provider, *, chat: bool = False, model: str = "") -> dict:
+    """Never-throw connection probe (SPEC.md §8).
+
+    Always lists models (reachability + auth); with ``chat`` also runs a
+    one-token chat call against ``model`` to prove end-to-end access. Failures
+    come back as ``success: False`` with the scrubbed provider message and a
+    friendly hint — this function never raises.
+    """
+    result: dict = {"success": False, "list_models": None, "chat": None}
+    try:
+        models = await provider.list_models()
+    except Exception as err:
+        message = str(err)
+        result["list_models"] = {
+            "success": False,
+            "message": message,
+            "hint": friendly_hint(message),
+            "models": [],
+        }
+        return result
+    listed = [m for m in models if isinstance(m, str)]
+    result["list_models"] = {
+        "success": True,
+        "message": f"Connected. {len(listed)} model(s) available.",
+        "hint": "",
+        "models": listed,
+    }
+    result["success"] = True
+    if chat:
+        try:
+            await provider.chat([{"role": "user", "content": "ping"}], model=model)
+        except Exception as err:
+            message = str(err)
+            result["chat"] = {
+                "success": False,
+                "message": message,
+                "hint": friendly_hint(message),
+            }
+            result["success"] = False
+        else:
+            result["chat"] = {
+                "success": True,
+                "message": f"Chat OK: {model or 'default model'} responded.",
+                "hint": "",
+            }
+    return result
 
 
 def chat_response(result: TurnResult) -> dict:

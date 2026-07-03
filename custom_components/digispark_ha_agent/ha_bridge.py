@@ -15,6 +15,7 @@ exposure settings is a candidate for a later phase.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from functools import partial
@@ -30,9 +31,14 @@ from .automations.writer import (
     replace_agent_automation,
     write_draft_automation,
 )
+from .config_schema import merge_settings, redacted_settings
 from .const import (
+    CONF_MODEL,
     DOMAIN,
+    MODEL_FETCH_TIMEOUT_SECONDS,
     PATTERN_LOOKBACK_DAYS,
+    PROVIDER_ANTHROPIC,
+    PROVIDER_LOCAL,
     SUGGESTION_STORE_FILENAME,
     VERSION_STORE_FILENAME,
 )
@@ -43,6 +49,7 @@ from .patterns.suggestions import (
     SuggestionStoreError,
     synthesize_automation,
 )
+from .runtime import build_provider, friendly_hint, probe_provider
 from .staleness import StaleDetector
 from .versioning import VersionStore, utc_now_iso
 
@@ -575,3 +582,124 @@ async def async_accept_suggestion(
     cached = hass.data.get(DOMAIN, {}).get(_SUGGESTION_SCAN) or {}
     await _cache_pending(hass, cached.get("scanned_at") or utc_now_iso())
     return {"automation_id": written["id"], "suggestion": accepted}
+
+
+# --- Provider settings (WS surface, not model-invokable; SPEC §8) ---------------
+
+
+def _settings_entry(hass: HomeAssistant, entry_id: str | None):
+    """The addressed config entry, or the sole one when unambiguous."""
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if entry_id:
+        for entry in entries:
+            if entry.entry_id == entry_id:
+                return entry
+        return None
+    return entries[0] if len(entries) == 1 else None
+
+
+async def async_get_provider_settings(
+    hass: HomeAssistant, *, entry_id: str | None = None
+) -> dict | None:
+    """The entry's provider settings, redacted for the panel (SPEC §8)."""
+    entry = _settings_entry(hass, entry_id)
+    if entry is None:
+        return None
+    return {"settings": redacted_settings(dict(entry.data), dict(entry.options))}
+
+
+async def async_update_provider_settings(
+    hass: HomeAssistant, updates: dict, *, entry_id: str | None = None
+) -> dict | None:
+    """Apply a partial settings update; validate, persist, reload (SPEC §8).
+
+    Validation runs through the same connection_problem rules as the create
+    form. On success the config entry is updated — the entry's update
+    listener reloads the agent, so the change takes effect immediately.
+    On a problem nothing is written and the current settings are returned.
+    """
+    entry = _settings_entry(hass, entry_id)
+    if entry is None:
+        return None
+    data, options, problem = merge_settings(
+        dict(entry.data), dict(entry.options), dict(updates)
+    )
+    if problem:
+        return {
+            "success": False,
+            "error": problem,
+            "settings": redacted_settings(dict(entry.data), dict(entry.options)),
+        }
+    hass.config_entries.async_update_entry(entry, data=data, options=options)
+    return {
+        "success": True,
+        "error": None,
+        "settings": redacted_settings(data, options),
+    }
+
+
+async def async_test_provider_connection(
+    hass: HomeAssistant, *, entry_id: str | None = None, chat: bool = False
+) -> dict | None:
+    """Connection test: model-list probe + optional one-token chat (SPEC §8).
+
+    The chat probe runs against the configured model with a one-token budget.
+    It is only meaningful for the Anthropic-format provider; the local
+    backend's chat path goes through the specialist router, so its test is
+    the model-list probe alone.
+    """
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    entry = _settings_entry(hass, entry_id)
+    if entry is None:
+        return None
+    data = dict(entry.data)
+    options = dict(entry.options)
+    chat_supported = data.get("provider", PROVIDER_ANTHROPIC) != PROVIDER_LOCAL
+    provider = build_provider(
+        async_get_clientsession(hass), data, options, max_tokens_override=1
+    )
+    result = await probe_provider(
+        provider,
+        chat=chat and chat_supported,
+        model=str(options.get(CONF_MODEL, "") or ""),
+    )
+    if chat and not chat_supported:
+        result["chat"] = {
+            "success": False,
+            "message": "The chat probe is not supported for the local provider.",
+            "hint": "",
+        }
+    return result
+
+
+async def async_list_provider_models(
+    hass: HomeAssistant, *, entry_id: str | None = None
+) -> dict | None:
+    """Live model list using the entry's stored credentials (SPEC §8)."""
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    entry = _settings_entry(hass, entry_id)
+    if entry is None:
+        return None
+    provider = build_provider(
+        async_get_clientsession(hass), dict(entry.data), dict(entry.options)
+    )
+    try:
+        async with asyncio.timeout(MODEL_FETCH_TIMEOUT_SECONDS):
+            models = await provider.list_models()
+    except Exception as err:
+        message = str(err)
+        return {
+            "success": False,
+            "models": [],
+            "message": message,
+            "hint": friendly_hint(message),
+        }
+    listed = [m for m in models if isinstance(m, str)]
+    return {
+        "success": True,
+        "models": listed,
+        "message": f"{len(listed)} model(s) available.",
+        "hint": "",
+    }
