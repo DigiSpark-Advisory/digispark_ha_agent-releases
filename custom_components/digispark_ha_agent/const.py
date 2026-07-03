@@ -1,0 +1,80 @@
+"""Constants for the DigiSpark HA Agent integration.
+
+Copyright (c) 2026 DigiSpark Advisory LLC. All rights reserved.
+Clean-room implementation — see PROVENANCE.md.
+"""
+
+from __future__ import annotations
+
+DOMAIN = "digispark_ha_agent"
+
+# Config-entry keys.
+CONF_PROVIDER = "provider"
+CONF_API_KEY = "api_key"
+CONF_MODEL = "model"
+CONF_MAX_TOKENS = "max_tokens"
+
+# Supported providers, selectable in the config flow (SPEC.md §8).
+PROVIDER_ANTHROPIC = "anthropic"
+# Local, privacy-first backend (OpenAI-compatible: llama-server / Ollama),
+# recommended weights = the Apache-2.0 Selora AI model (SPEC.md §2.1).
+PROVIDER_LOCAL = "local"
+SUPPORTED_PROVIDERS: tuple[str, ...] = (PROVIDER_ANTHROPIC, PROVIDER_LOCAL)
+
+# Local backend (SPEC.md §2.1). The host is stored in entry.data; cleartext
+# http is only accepted for explicitly local hosts (providers/local.py).
+CONF_HOST = "host"
+DEFAULT_LOCAL_HOST = "http://localhost:8080"
+# Conversation turns of history sent to the local model (model card).
+LOCAL_HISTORY_TURNS = 3
+# Cap on the AVAILABLE ENTITIES context block so a large home cannot exhaust
+# the local model's context window.
+MAX_LOCAL_ENTITY_BLOCK_CHARS = 4000
+
+# Pattern-detection / stale-detection tunables (SPEC.md §11, §13).
+PATTERN_MIN_CONFIDENCE = 0.7
+# Pattern detection (SPEC.md §11). History lookback the bridge feeds the
+# engine (owner decision, 2026-07-03: 14 days, exposed entities only).
+PATTERN_LOOKBACK_DAYS = 14
+# Distinct occurrences (days for routines, precondition events for
+# correlations/sequences) required before a candidate is considered.
+PATTERN_MIN_SUPPORT = 3
+# Gap threshold when clustering time-of-day occurrences, minutes.
+PATTERN_TIME_TOLERANCE_MINUTES = 30
+# Window in which B must follow A for correlations/sequences, seconds.
+PATTERN_CORRELATION_WINDOW_SECONDS = 300
+# Periodic detection-scan cadence; the WS surface supports an on-demand
+# rescan (owner decision, 2026-07-03: daily).
+PATTERN_SCAN_INTERVAL_HOURS = 24
+STALE_IDLE_DAYS = 30
+# Periodic advisory-only stale scan cadence (SPEC.md §13).
+STALE_SCAN_INTERVAL_HOURS = 6
+
+# Version-store sidecar for agent-managed automations (SPEC.md §12). Lives
+# under .storage/ beside HA's own store files; plain JSON managed by the
+# HA-free versioning/store.py via executor.
+VERSION_STORE_FILENAME = f"{DOMAIN}.versions.json"
+
+# Suggestions sidecar (SPEC.md §11): pending pattern suggestions plus the
+# permanent dismissed/accepted signature memory (a decision never resurfaces).
+SUGGESTION_STORE_FILENAME = f"{DOMAIN}.suggestions.json"
+
+# Agent-loop limits (see SPEC.md §3–§4).
+MAX_LOOP_ITERATIONS = 8
+MAX_DATA_MESSAGE_CHARS = 50_000
+# Per-request message-window cap so capped data messages cannot stack past the
+# context limit or the per-minute token budget (SPEC.md §4).
+MAX_CONTEXT_MESSAGES = 40
+CONVERSATION_TTL_SECONDS = 30 * 60
+
+# Provider request settings (see SPEC.md §2).
+PROVIDER_TIMEOUT_SECONDS = 300
+# Anthropic requires an explicit output-token budget on every Messages call.
+# User-configurable via the config flow; this is the default.
+DEFAULT_MAX_TOKENS = 4096
+# Fallback model offered when the provider's model list cannot be fetched
+# (SPEC.md §8); with a live provider the config flow lists models dynamically.
+DEFAULT_MODEL = "claude-fable-5"
+# The flow queries list_models() with its own short timeout so a down backend
+# cannot hang the form for the provider's generous chat timeout.
+MODEL_FETCH_TIMEOUT_SECONDS = 10

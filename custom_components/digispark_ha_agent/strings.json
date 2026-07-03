@@ -1,0 +1,39 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "DigiSpark HA Agent",
+        "description": "Connect the agent to a model provider.",
+        "data": {
+          "provider": "Provider",
+          "api_key": "API key (cloud providers)",
+          "host": "Local backend URL (local provider)"
+        }
+      },
+      "model": {
+        "title": "Model",
+        "description": "Pick a model. The list is fetched live from the provider; if it could not be fetched, enter a model id.",
+        "data": {
+          "model": "Model",
+          "max_tokens": "Max output tokens"
+        }
+      }
+    },
+    "error": {
+      "api_key_required": "An API key is required for this provider.",
+      "invalid_host": "Enter the local backend as an http(s) URL.",
+      "cleartext_remote_host": "Cleartext http is only allowed for local hosts; use https for remote backends."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "DigiSpark HA Agent options",
+        "data": {
+          "model": "Model",
+          "max_tokens": "Max output tokens"
+        }
+      }
+    }
+  }
+}

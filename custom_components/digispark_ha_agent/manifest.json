@@ -1,0 +1,14 @@
+{
+  "domain": "digispark_ha_agent",
+  "name": "DigiSpark HA Agent",
+  "after_dependencies": ["recorder"],
+  "codeowners": ["@DigiSpark-Advisory"],
+  "config_flow": true,
+  "dependencies": ["conversation", "http", "websocket_api"],
+  "documentation": "https://github.com/DigiSpark-Advisory/digispark_ha_agent",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/DigiSpark-Advisory/digispark_ha_agent/issues",
+  "requirements": ["ruamel.yaml>=0.18.0"],
+  "version": "0.4.0"
+}
