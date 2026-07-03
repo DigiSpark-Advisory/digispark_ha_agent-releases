@@ -1,11 +1,11 @@
 """Pattern detection -> automation-suggestion engine.
 
 Copyright (c) 2026 DigiSpark Advisory LLC. All rights reserved.
-Clean-room implementation authored from SPEC.md §11 - see PROVENANCE.md.
+Clean-room implementation authored from SPEC.md 11 - see PROVENANCE.md.
 
 Deterministic analytics over recorder history the bridge supplies (owner
 decision 2026-07-03: 14 days of state changes for exposed entities only -
-PATTERN_LOOKBACK_DAYS). Three signals (SPEC §11):
+PATTERN_LOOKBACK_DAYS). Three signals (SPEC 11):
 
 - time-of-day routines: an entity reliably reaches a state near a clock time;
 - device correlations: B tends to follow A within a short window;
@@ -79,7 +79,7 @@ class StateEvent:
 
 
 class PatternEngine:
-    """Detects routines/correlations/sequences and scores them (SPEC §11).
+    """Detects routines/correlations/sequences and scores them (SPEC 11).
 
     ``tz_offset_minutes`` shifts UTC event times into the home's local clock
     for the time-of-day detector; the bridge supplies HA's configured offset.

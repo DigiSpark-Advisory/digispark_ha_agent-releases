@@ -1,4 +1,4 @@
-"""Pattern detection & suggestions. See SPEC.md §11 and PROVENANCE.md."""
+"""Pattern detection & suggestions. See SPEC.md 11 and PROVENANCE.md."""
 
 from __future__ import annotations
 
