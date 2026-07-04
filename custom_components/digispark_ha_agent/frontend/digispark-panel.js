@@ -302,6 +302,12 @@ class DigiSparkAgentPanel extends HTMLElement {
     this._cardVersions = [];
     this._cardBody = null;
     this._cardDiff = null;
+    this._draftsLoading = false;
+    this._staleLoading = false;
+    this._suggLoading = false;
+    this._draftsError = "";
+    this._staleError = "";
+    this._suggError = "";
     this._theme = "follow";
     this.attachShadow({ mode: "open" });
   }
@@ -657,45 +663,73 @@ class DigiSparkAgentPanel extends HTMLElement {
     this._renderPending();
   }
 
-  async _refreshReview(rescan) {
+  // Paint the Automations shell immediately, then load each section
+  // independently so a slow recorder scan can never blank the view or block
+  // the drafts list (v0.6.1 fix).
+  _refreshReview(rescan) {
     if (!this._hass) return;
+    this._renderAutomations();
+    this._loadDrafts();
+    this._loadStale(rescan);
+    this._loadSuggestions(rescan);
+  }
+
+  async _loadDrafts() {
+    this._draftsLoading = true;
+    this._draftsError = "";
+    this._renderAutomations();
     try {
       const res = await this._ws({ type: "digispark_ha_agent/list_drafts" });
       this._drafts = (res && res.drafts) || [];
-    } catch (_err) {
+    } catch (err) {
       this._drafts = [];
+      this._draftsError = (err && err.message) || "Could not load automations";
     }
+    this._draftsLoading = false;
+    this._renderAutomations();
+  }
+
+  async _loadStale(rescan) {
+    this._staleLoading = true;
+    this._staleError = "";
+    this._renderAutomations();
     try {
       const msg = { type: "digispark_ha_agent/stale_advisories" };
       if (rescan) msg.rescan = true;
       const res = await this._ws(msg);
       this._advisories = (res && res.advisories) || [];
       this._scannedAt = (res && res.scanned_at) || "";
-    } catch (_err) {
+    } catch (err) {
       this._advisories = [];
       this._scannedAt = "";
+      this._staleError =
+        (err && err.message) || "Could not scan for stale automations";
     }
-    await this._refreshSuggestions(false);
+    this._staleLoading = false;
     this._renderAutomations();
   }
 
-  async _refreshSuggestions(rescan) {
-    if (!this._hass) return;
+  async _loadSuggestions(rescan) {
+    this._suggLoading = true;
+    this._suggError = "";
+    this._renderAutomations();
     try {
       const msg = { type: "digispark_ha_agent/list_suggestions" };
       if (rescan) msg.rescan = true;
       const res = await this._ws(msg);
       this._suggestions = (res && res.suggestions) || [];
       this._suggScannedAt = (res && res.scanned_at) || "";
-    } catch (_err) {
+    } catch (err) {
       this._suggestions = [];
       this._suggScannedAt = "";
+      this._suggError = (err && err.message) || "Could not load suggestions";
     }
+    this._suggLoading = false;
+    this._renderAutomations();
   }
 
-  async _rescanSuggestions() {
-    await this._refreshSuggestions(true);
-    this._renderAutomations();
+  _rescanSuggestions() {
+    this._loadSuggestions(true);
   }
 
   async _actOnSuggestion(act, signature) {
@@ -1320,7 +1354,7 @@ class DigiSparkAgentPanel extends HTMLElement {
         if (a === "accept" || a === "discard") this._actOnDraft(a, id);
         else if (a === "expand") this._toggleCard(id);
         else if (a === "diff") this._showCardDiff(id);
-        else if (a === "rescan-stale") this._refreshReview(true);
+        else if (a === "rescan-stale") this._loadStale(true);
         return;
       }
       const sugg = ev.target.closest("button[data-sugg-act]");
@@ -1494,18 +1528,28 @@ class DigiSparkAgentPanel extends HTMLElement {
       const suggScanned = this._suggScannedAt
         ? `<span class="badge">scanned ${esc(this._suggScannedAt)}</span>`
         : "";
-      const list = this._suggestions.length
-        ? this._suggestions.map((s) => this._suggestionRow(s)).join("")
-        : `<div class="none">No pattern suggestions.</div>`;
+      let list;
+      if (this._suggLoading && !this._suggestions.length)
+        list = `<div class="none">Loading suggestions…</div>`;
+      else if (this._suggError && !this._suggestions.length)
+        list = `<div class="none">${esc(this._suggError)}</div>`;
+      else if (this._suggestions.length)
+        list = this._suggestions.map((s) => this._suggestionRow(s)).join("");
+      else list = `<div class="none">No pattern suggestions.</div>`;
       body = `<div class="auto-body">
           <h3>Suggestions ${suggScanned}
-            <button class="ghost" data-sugg-act="rescan">Rescan</button>
+            <button class="ghost" data-sugg-act="rescan">${this._suggLoading ? "Scanning…" : "Rescan"}</button>
           </h3>
           ${list}</div>`;
     } else {
-      const cards = this._drafts.length
-        ? `<div class="cards">${this._drafts.map((d) => this._card(d)).join("")}</div>`
-        : `<div class="none">No agent automations yet.</div>`;
+      let cards;
+      if (this._draftsLoading && !this._drafts.length)
+        cards = `<div class="none">Loading automations…</div>`;
+      else if (this._draftsError && !this._drafts.length)
+        cards = `<div class="none">${esc(this._draftsError)}</div>`;
+      else if (this._drafts.length)
+        cards = `<div class="cards">${this._drafts.map((d) => this._card(d)).join("")}</div>`;
+      else cards = `<div class="none">No agent automations yet.</div>`;
       const orphans = this._advisories.filter(
         (a) => !this._drafts.some((d) => d.id === a.automation_id),
       );
@@ -1520,9 +1564,14 @@ class DigiSparkAgentPanel extends HTMLElement {
             )
             .join("")}`
         : "";
+      let staleStatus;
+      if (this._staleLoading) staleStatus = "Scanning for stale automations…";
+      else if (this._staleError) staleStatus = esc(this._staleError);
+      else if (this._scannedAt) staleStatus = `Stale scan: ${esc(this._scannedAt)}`;
+      else staleStatus = "";
       const scanBar = `<div class="auto-scan">
-          <span class="none">${this._scannedAt ? `Stale scan: ${esc(this._scannedAt)}` : ""}</span>
-          <button class="ghost" data-auto-act="rescan-stale">Rescan stale</button>
+          <span class="none">${staleStatus}</span>
+          <button class="ghost" data-auto-act="rescan-stale">${this._staleLoading ? "Scanning…" : "Rescan stale"}</button>
         </div>`;
       body = `<div class="auto-body">${scanBar}${cards}${orphanHtml}</div>`;
     }
