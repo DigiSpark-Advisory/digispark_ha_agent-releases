@@ -39,6 +39,7 @@ from .const import (
     PATTERN_LOOKBACK_DAYS,
     PROVIDER_ANTHROPIC,
     PROVIDER_LOCAL,
+    SESSION_STORE_FILENAME,
     SUGGESTION_STORE_FILENAME,
     VERSION_STORE_FILENAME,
 )
@@ -50,6 +51,7 @@ from .patterns.suggestions import (
     synthesize_automation,
 )
 from .runtime import build_provider, friendly_hint, probe_provider
+from .sessions import SessionStore
 from .staleness import StaleDetector
 from .versioning import VersionStore, utc_now_iso
 
@@ -703,3 +705,97 @@ async def async_list_provider_models(
         "message": f"{len(listed)} model(s) available.",
         "hint": "",
     }
+
+
+# --- Conversation sessions (SPEC §7) ---------------------------------------
+
+# Keys within hass.data[DOMAIN] for the session store and the turn lock.
+_SESSION_STORE = "session_store"
+_SESSION_LOCK = "session_lock"
+
+
+def _session_store(hass: HomeAssistant) -> SessionStore:
+    """Return the shared session store, creating it on first use."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    store = domain_data.get(_SESSION_STORE)
+    if store is None:
+        store = SessionStore(hass.config.path(".storage", SESSION_STORE_FILENAME))
+        domain_data[_SESSION_STORE] = store
+    return store
+
+
+def _session_lock(hass: HomeAssistant) -> asyncio.Lock:
+    """The lock serializing turns so sessions cannot interleave in one loop."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    lock = domain_data.get(_SESSION_LOCK)
+    if lock is None:
+        lock = asyncio.Lock()
+        domain_data[_SESSION_LOCK] = lock
+    return lock
+
+
+async def async_list_sessions(hass: HomeAssistant) -> dict:
+    """Session summaries, most recently active first (SPEC §7)."""
+    store = _session_store(hass)
+    return {"sessions": await hass.async_add_executor_job(store.list_sessions)}
+
+
+async def async_create_session(hass: HomeAssistant, title: str = "") -> dict:
+    """Create one empty session and return its summary (SPEC §7)."""
+    store = _session_store(hass)
+    return await hass.async_add_executor_job(store.create_session, title)
+
+
+async def async_rename_session(
+    hass: HomeAssistant, session_id: str, title: str
+) -> dict:
+    """Rename one session and return its summary (SPEC §7)."""
+    store = _session_store(hass)
+    return await hass.async_add_executor_job(store.rename_session, session_id, title)
+
+
+async def async_delete_session(hass: HomeAssistant, session_id: str) -> dict:
+    """Delete one session (explicit user action) and return its summary."""
+    store = _session_store(hass)
+    return await hass.async_add_executor_job(store.delete_session, session_id)
+
+
+async def async_chat_turn(
+    hass: HomeAssistant, agent, message: str, *, session_id: str | None = None
+) -> dict:
+    """Run one agent turn against one session (SPEC §3, §7).
+
+    Loads the session's committed history into the loop, runs the turn, and
+    persists the new history back. The session lock serializes turns so two
+    concurrent chats cannot interleave different sessions' histories through
+    the entry's single loop. An absent session id targets the most recently
+    active session, created on demand, so a session-unaware client keeps
+    working unchanged.
+    """
+    store = _session_store(hass)
+    async with _session_lock(hass):
+        if session_id is None:
+            session_id = await hass.async_add_executor_job(store.latest_session_id)
+        if session_id is None:
+            created = await hass.async_add_executor_job(store.create_session)
+            session_id = created["id"]
+        messages = await hass.async_add_executor_job(store.get_messages, session_id)
+        agent.load_history(messages)
+        result = await agent.run_turn(message)
+        await hass.async_add_executor_job(
+            store.commit_messages, session_id, agent.history
+        )
+    return {"session_id": session_id, "result": result}
+
+
+async def async_session_history(
+    hass: HomeAssistant, *, session_id: str | None = None
+) -> dict:
+    """One session's committed conversation for restore (SPEC §7, §9)."""
+    store = _session_store(hass)
+    if session_id is None:
+        session_id = await hass.async_add_executor_job(store.latest_session_id)
+        if session_id is None:
+            return {"session_id": None, "messages": []}
+    messages = await hass.async_add_executor_job(store.get_messages, session_id)
+    return {"session_id": session_id, "messages": messages}
