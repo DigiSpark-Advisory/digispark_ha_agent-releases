@@ -22,21 +22,28 @@ from ..const import DOMAIN
 from ..ha_bridge import (
     async_accept_draft,
     async_accept_suggestion,
+    async_chat_turn,
+    async_create_session,
+    async_delete_session,
     async_discard_draft,
     async_dismiss_suggestion,
     async_get_provider_settings,
     async_get_version,
     async_list_drafts,
     async_list_provider_models,
+    async_list_sessions,
     async_list_suggestions,
     async_list_versions,
+    async_rename_session,
     async_rollback,
+    async_session_history,
     async_stale_advisories,
     async_test_provider_connection,
     async_update_provider_settings,
 )
 from ..patterns.suggestions import SuggestionStoreError
-from ..runtime import chat_response, history_response
+from ..runtime import chat_response
+from ..sessions import SessionNotFoundError, SessionStoreError
 from ..versioning import VersionStoreError
 
 if TYPE_CHECKING:
@@ -73,6 +80,10 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_update_provider_settings)
     websocket_api.async_register_command(hass, websocket_test_connection)
     websocket_api.async_register_command(hass, websocket_list_provider_models)
+    websocket_api.async_register_command(hass, websocket_list_sessions)
+    websocket_api.async_register_command(hass, websocket_create_session)
+    websocket_api.async_register_command(hass, websocket_rename_session)
+    websocket_api.async_register_command(hass, websocket_delete_session)
     domain_data[_WS_REGISTERED] = True
 
 
@@ -116,6 +127,7 @@ def _action_payload(action: Any) -> dict:
     {
         vol.Required("type"): "digispark_ha_agent/chat",
         vol.Required("message"): str,
+        vol.Optional("session_id"): str,
         vol.Optional("entry_id"): str,
     }
 )
@@ -123,7 +135,7 @@ def _action_payload(action: Any) -> dict:
 async def websocket_chat(
     hass: HomeAssistant, connection: ActiveConnection, msg: dict
 ) -> None:
-    """Run one agent turn and return the answer (admin-gated, SPEC.md §8)."""
+    """Run one agent turn in one session (admin-gated, SPEC.md §7–§8)."""
     agent = _resolve_agent(hass, msg.get("entry_id"))
     if agent is None:
         connection.send_error(
@@ -131,17 +143,29 @@ async def websocket_chat(
         )
         return
     try:
-        result = await agent.run_turn(msg["message"])
+        outcome = await async_chat_turn(
+            hass, agent, msg["message"], session_id=msg.get("session_id")
+        )
+    except SessionNotFoundError as err:
+        connection.send_error(msg["id"], "not_found", str(err))
+        return
+    except SessionStoreError as err:
+        connection.send_error(msg["id"], "sessions_failed", str(err))
+        return
     except Exception as err:  # surface provider/loop errors to the client
         connection.send_error(msg["id"], "chat_failed", str(err))
         return
-    connection.send_result(msg["id"], chat_response(result))
+    connection.send_result(
+        msg["id"],
+        {**chat_response(outcome["result"]), "session_id": outcome["session_id"]},
+    )
 
 
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "digispark_ha_agent/history",
+        vol.Optional("session_id"): str,
         vol.Optional("entry_id"): str,
     }
 )
@@ -149,14 +173,22 @@ async def websocket_chat(
 async def websocket_history(
     hass: HomeAssistant, connection: ActiveConnection, msg: dict
 ) -> None:
-    """Return the committed conversation for session restore (SPEC.md §7, §9)."""
+    """Return one session's conversation for session restore (SPEC.md §7, §9)."""
     agent = _resolve_agent(hass, msg.get("entry_id"))
     if agent is None:
         connection.send_error(
             msg["id"], "not_found", "No configured DigiSpark HA Agent entry"
         )
         return
-    connection.send_result(msg["id"], {"messages": history_response(agent)})
+    try:
+        result = await async_session_history(hass, session_id=msg.get("session_id"))
+    except SessionNotFoundError as err:
+        connection.send_error(msg["id"], "not_found", str(err))
+        return
+    except SessionStoreError as err:
+        connection.send_error(msg["id"], "sessions_failed", str(err))
+        return
+    connection.send_result(msg["id"], result)
 
 
 @websocket_api.require_admin
@@ -555,3 +587,87 @@ async def websocket_list_provider_models(
         )
         return
     connection.send_result(msg["id"], result)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "digispark_ha_agent/list_sessions"}
+)
+@websocket_api.async_response
+async def websocket_list_sessions(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """List conversation sessions, most recently active first (SPEC.md §7)."""
+    try:
+        result = await async_list_sessions(hass)
+    except SessionStoreError as err:
+        connection.send_error(msg["id"], "sessions_failed", str(err))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "digispark_ha_agent/create_session",
+        vol.Optional("title"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_create_session(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """Create one empty conversation session (SPEC.md §7)."""
+    try:
+        session = await async_create_session(hass, msg.get("title", ""))
+    except SessionStoreError as err:
+        connection.send_error(msg["id"], "sessions_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"session": session})
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "digispark_ha_agent/rename_session",
+        vol.Required("session_id"): str,
+        vol.Required("title"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_rename_session(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """Rename one conversation session (SPEC.md §7)."""
+    try:
+        session = await async_rename_session(hass, msg["session_id"], msg["title"])
+    except SessionNotFoundError as err:
+        connection.send_error(msg["id"], "not_found", str(err))
+        return
+    except SessionStoreError as err:
+        connection.send_error(msg["id"], "sessions_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"session": session})
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "digispark_ha_agent/delete_session",
+        vol.Required("session_id"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_delete_session(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """Delete one conversation session (explicit user action, SPEC.md §7)."""
+    try:
+        session = await async_delete_session(hass, msg["session_id"])
+    except SessionNotFoundError as err:
+        connection.send_error(msg["id"], "not_found", str(err))
+        return
+    except SessionStoreError as err:
+        connection.send_error(msg["id"], "sessions_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"deleted": session})
