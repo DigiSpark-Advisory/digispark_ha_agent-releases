@@ -139,6 +139,11 @@ class LocalAgentLoop:
         self._history = []
         self._continue_with = None
 
+    def load_history(self, messages: list[dict]) -> None:
+        """Replace committed history with one session's messages (SPEC §7)."""
+        self._history = [dict(message) for message in messages]
+        self._continue_with = None
+
     async def run_turn(
         self, user_message: str, *, cancel: CancelCheck | None = None
     ) -> TurnResult:
