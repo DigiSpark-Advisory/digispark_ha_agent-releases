@@ -78,13 +78,18 @@ VERSION_STORE_FILENAME = f"{DOMAIN}.versions.json"
 # permanent dismissed/accepted signature memory (a decision never resurfaces).
 SUGGESTION_STORE_FILENAME = f"{DOMAIN}.suggestions.json"
 
+# Conversation-sessions sidecar (SPEC.md §7, v0.6.0): server-side sessions,
+# persisted, user-managed lifecycle. The 30-minute auto-expiry was retired
+# with multi-session support (owner decision, 2026-07-03); the session cap
+# in sessions/store.py bounds the store instead.
+SESSION_STORE_FILENAME = f"{DOMAIN}.sessions.json"
+
 # Agent-loop limits (see SPEC.md §3–§4).
 MAX_LOOP_ITERATIONS = 8
 MAX_DATA_MESSAGE_CHARS = 50_000
 # Per-request message-window cap so capped data messages cannot stack past the
 # context limit or the per-minute token budget (SPEC.md §4).
 MAX_CONTEXT_MESSAGES = 40
-CONVERSATION_TTL_SECONDS = 30 * 60
 
 # Provider request settings (see SPEC.md §2).
 PROVIDER_TIMEOUT_SECONDS = 300
