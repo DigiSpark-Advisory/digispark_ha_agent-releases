@@ -179,12 +179,3 @@ def chat_response(result: TurnResult) -> dict:
         "iterations": result.iterations,
         "reason": result.reason,
     }
-
-
-def history_response(agent: AgentLoop) -> list[dict]:
-    """Return the agent's committed conversation for session restore.
-
-    Conversation state lives server-side in the loop (SPEC.md §7, §9); this
-    returns a copy so callers cannot mutate the stored history.
-    """
-    return list(agent.history)
