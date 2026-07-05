@@ -189,6 +189,8 @@ const SETTINGS_ERRORS = {
 };
 
 const CREDENTIAL_KINDS = ["x-api-key", "bearer", "custom_header", "none"];
+// Poll interval while a background pattern scan is in flight (SPEC §11 perf).
+const SUGG_POLL_MS = 4000;
 
 // The three routable views, in tab order.
 const VIEWS = [
@@ -308,6 +310,8 @@ class DigiSparkAgentPanel extends HTMLElement {
     this._draftsError = "";
     this._staleError = "";
     this._suggError = "";
+    this._suggScanning = false;
+    this._suggPollTimer = null;
     this._theme = "follow";
     this.attachShadow({ mode: "open" });
   }
@@ -357,6 +361,10 @@ class DigiSparkAgentPanel extends HTMLElement {
     if (this._ro) {
       this._ro.disconnect();
       this._ro = null;
+    }
+    if (this._suggPollTimer) {
+      clearTimeout(this._suggPollTimer);
+      this._suggPollTimer = null;
     }
   }
 
@@ -719,13 +727,41 @@ class DigiSparkAgentPanel extends HTMLElement {
       const res = await this._ws(msg);
       this._suggestions = (res && res.suggestions) || [];
       this._suggScannedAt = (res && res.scanned_at) || "";
+      this._suggScanning = !!(res && res.scanning);
     } catch (err) {
       this._suggestions = [];
       this._suggScannedAt = "";
+      this._suggScanning = false;
       this._suggError = (err && err.message) || "Could not load suggestions";
     }
     this._suggLoading = false;
     this._renderAutomations();
+    if (this._suggScanning) this._scheduleSuggPoll();
+  }
+
+  // A pattern scan runs in the background (SPEC §11 perf): the backend returns
+  // scanning:true immediately, so poll (cache-first, no rescan) until it clears
+  // and the results appear on their own. Only polls while the Automations view
+  // is open; the timer is cleared on disconnect.
+  _scheduleSuggPoll() {
+    if (this._suggPollTimer) return;
+    this._suggPollTimer = setTimeout(() => {
+      this._suggPollTimer = null;
+      if (this._view === "automations") this._pollSuggestions();
+    }, SUGG_POLL_MS);
+  }
+
+  async _pollSuggestions() {
+    try {
+      const res = await this._ws({ type: "digispark_ha_agent/list_suggestions" });
+      this._suggestions = (res && res.suggestions) || [];
+      this._suggScannedAt = (res && res.scanned_at) || "";
+      this._suggScanning = !!(res && res.scanning);
+    } catch (_err) {
+      this._suggScanning = false;
+    }
+    this._renderAutomations();
+    if (this._suggScanning) this._scheduleSuggPoll();
   }
 
   _rescanSuggestions() {
@@ -1528,6 +1564,7 @@ class DigiSparkAgentPanel extends HTMLElement {
       const suggScanned = this._suggScannedAt
         ? `<span class="badge">scanned ${esc(this._suggScannedAt)}</span>`
         : "";
+      const suggScanningNow = this._suggLoading || this._suggScanning;
       let list;
       if (this._suggLoading && !this._suggestions.length)
         list = `<div class="none">Loading suggestions…</div>`;
@@ -1535,10 +1572,12 @@ class DigiSparkAgentPanel extends HTMLElement {
         list = `<div class="none">${esc(this._suggError)}</div>`;
       else if (this._suggestions.length)
         list = this._suggestions.map((s) => this._suggestionRow(s)).join("");
+      else if (this._suggScanning)
+        list = `<div class="none">Scanning your history in the background — this can take a minute. Results appear here automatically.</div>`;
       else list = `<div class="none">No pattern suggestions.</div>`;
       body = `<div class="auto-body">
           <h3>Suggestions ${suggScanned}
-            <button class="ghost" data-sugg-act="rescan">${this._suggLoading ? "Scanning…" : "Rescan"}</button>
+            <button class="ghost" data-sugg-act="rescan"${suggScanningNow ? " disabled" : ""}>${suggScanningNow ? "Scanning…" : "Rescan"}</button>
           </h3>
           ${list}</div>`;
     } else {

@@ -37,6 +37,9 @@ from .const import (
     DOMAIN,
     MODEL_FETCH_TIMEOUT_SECONDS,
     PATTERN_LOOKBACK_DAYS,
+    PATTERN_MAX_EVENTS_PER_ENTITY,
+    PATTERN_MAX_TOTAL_EVENTS,
+    PATTERN_SCAN_DOMAINS,
     PROVIDER_ANTHROPIC,
     PROVIDER_LOCAL,
     SESSION_STORE_FILENAME,
@@ -44,6 +47,7 @@ from .const import (
     VERSION_STORE_FILENAME,
 )
 from .patterns import PatternEngine, StateEvent
+from .patterns.scan import bound_events, in_scan_scope
 from .patterns.suggestions import (
     STATUS_PENDING,
     SuggestionStore,
@@ -67,6 +71,9 @@ _STALE_ADVISORIES = "stale_advisories"
 # Keys within hass.data[DOMAIN] for the suggestion store + last scan (SPEC §11).
 _SUGGESTION_STORE = "suggestion_store"
 _SUGGESTION_SCAN = "suggestion_scan"
+# True while a background pattern scan is in flight (SPEC §11 perf); the scan
+# never runs on a WS request, so the panel can show progress instead of hang.
+_SUGGESTION_SCANNING = "suggestion_scanning"
 
 
 def build_adapters(hass: HomeAssistant) -> HomeAdapters:
@@ -490,26 +497,41 @@ async def _cache_pending(hass: HomeAssistant, scanned_at: str) -> dict:
 async def async_scan_patterns(hass: HomeAssistant) -> dict:
     """Run one detection pass over recorder history and update the store.
 
-    History (SPEC §11; owner decision 2026-07-03): the last
-    ``PATTERN_LOOKBACK_DAYS`` days of state changes for exposed entities only,
-    read from the local recorder — raw history never leaves the process.
-    Candidates that cannot be synthesized deterministically are dropped before
-    they become suggestions, so an accept can never dead-end.
+    Scope + volume are bounded (SPEC §11 perf; owner decision 2026-07-05):
+    only ``PATTERN_SCAN_DOMAINS`` entities are read from the recorder, any
+    single entity emitting more than ``PATTERN_MAX_EVENTS_PER_ENTITY`` changes
+    is dropped as noise, and the engine sees at most ``PATTERN_MAX_TOTAL_EVENTS``
+    (most recent) events. History (SPEC §11; owner decision 2026-07-03): the
+    last ``PATTERN_LOOKBACK_DAYS`` days of state changes for exposed, in-scope
+    entities only, read from the local recorder — raw history never leaves the
+    process. Candidates that cannot be synthesized deterministically are dropped
+    before they become suggestions, so an accept can never dead-end.
     """
     from homeassistant.components.recorder import get_instance, history
     from homeassistant.util import dt as dt_util
 
-    entity_ids = sorted(_exposed_entity_ids(hass))
+    entity_ids = sorted(
+        entity_id
+        for entity_id in _exposed_entity_ids(hass)
+        if in_scan_scope(entity_id, PATTERN_SCAN_DOMAINS)
+    )
     if entity_ids:
         start = dt_util.utcnow() - timedelta(days=PATTERN_LOOKBACK_DAYS)
         states = await get_instance(hass).async_add_executor_job(
             history.get_significant_states, hass, start, None, entity_ids
         )
-        events = [
-            StateEvent(entity_id, s.state, s.last_changed.timestamp())
+        events_by_entity = {
+            entity_id: [
+                StateEvent(entity_id, s.state, s.last_changed.timestamp())
+                for s in entity_states
+            ]
             for entity_id, entity_states in states.items()
-            for s in entity_states
-        ]
+        }
+        events = bound_events(
+            events_by_entity,
+            per_entity_cap=PATTERN_MAX_EVENTS_PER_ENTITY,
+            total_cap=PATTERN_MAX_TOTAL_EVENTS,
+        )
         offset = dt_util.now().utcoffset()
         tz_offset_minutes = int(offset.total_seconds() // 60) if offset else 0
         engine = PatternEngine(tz_offset_minutes=tz_offset_minutes)
@@ -520,12 +542,44 @@ async def async_scan_patterns(hass: HomeAssistant) -> dict:
     return await _cache_pending(hass, utc_now_iso())
 
 
+def request_suggestion_scan(hass: HomeAssistant) -> bool:
+    """Start a background pattern scan unless one is already running.
+
+    The heavy recorder read + superlinear engine pass must never run on a WS
+    request or block the panel (SPEC §11 perf). Returns True if a scan is now
+    in flight so callers can surface progress instead of hanging.
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if domain_data.get(_SUGGESTION_SCANNING):
+        return True
+    domain_data[_SUGGESTION_SCANNING] = True
+
+    async def _runner() -> None:
+        try:
+            await async_scan_patterns(hass)
+        except Exception:
+            _LOGGER.exception("background pattern scan failed")
+        finally:
+            hass.data.setdefault(DOMAIN, {})[_SUGGESTION_SCANNING] = False
+
+    hass.async_create_background_task(_runner(), "digispark_ha_agent pattern scan")
+    return True
+
+
 async def async_list_suggestions(hass: HomeAssistant, *, rescan: bool = False) -> dict:
-    """The latest cached suggestions, scanning first when asked or empty."""
-    cached = hass.data.get(DOMAIN, {}).get(_SUGGESTION_SCAN)
+    """Cached suggestions; kick off a background scan when asked or empty.
+
+    Never blocks: an empty cache (e.g. after a restart) or an explicit rescan
+    starts a background scan and returns immediately with ``scanning: True`` so
+    the panel shows progress rather than hanging on the cold scan (SPEC §11).
+    """
+    domain_data = hass.data.get(DOMAIN, {})
+    cached = domain_data.get(_SUGGESTION_SCAN)
+    scanning = bool(domain_data.get(_SUGGESTION_SCANNING))
     if rescan or cached is None:
-        return await async_scan_patterns(hass)
-    return cached
+        scanning = request_suggestion_scan(hass)
+    result = cached or {"suggestions": [], "scanned_at": None}
+    return {**result, "scanning": scanning}
 
 
 async def async_dismiss_suggestion(
@@ -544,12 +598,7 @@ async def async_dismiss_suggestion(
 async def async_accept_suggestion(
     hass: HomeAssistant, signature: str, *, author: str = "user"
 ) -> dict:
-    """Accept one pending suggestion into a §6 draft automation.
-
-    The synthesized body writes through the normal draft path — disabled,
-    agent-prefixed, version-recorded — and then shows up in the drafts inbox
-    for the usual review/enable step. Nothing is enabled here.
-    """
+    """Accept one pending suggestion into a §6 draft automation."""
     store = _suggestion_store(hass)
     record = await hass.async_add_executor_job(store.get, signature)
     if record["status"] != STATUS_PENDING:

@@ -13,6 +13,14 @@ order, and comments on unrelated automations. A non-list file is rejected
 rather than clobbered; a single-mapping trigger/condition/action is
 normalized to a one-element list instead of being dropped.
 
+Home Assistant reads automations.yaml with a YAML 1.1 loader (PyYAML), while
+ruamel dumps under YAML 1.2. Scalars that YAML 1.1 resolves to non-strings —
+``10:00:00`` (sexagesimal int), ``on`` (bool), ``null``, numeric-like text —
+are emitted unquoted by ruamel and then silently retyped on HA's side (the
+``at: 10:00:00`` -> 36000 draft-corruption bug). We force a quoted style on
+exactly those scalars before dumping, and a YAML 1.1 round-trip guard aborts
+the write if any scalar's value would still change on reload.
+
 Pure filesystem logic — no Home Assistant imports; callers run it in an
 executor (the event loop must not block on disk I/O).
 """
@@ -21,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -30,6 +39,7 @@ from uuid import uuid4
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
+from ruamel.yaml.scalarstring import ScalarString, SingleQuotedScalarString
 
 AGENT_ID_PREFIX = "digispark_agent_"
 AGENT_ALIAS_PREFIX = "[DigiSpark Agent] "
@@ -39,6 +49,34 @@ AGENT_ALIAS_PREFIX = "[DigiSpark Agent] "
 # be shadowed or overwritten.
 _STRIPPED_KEYS = frozenset({"enabled", "initial_state", "id"})
 _NORMALIZED_LIST_KEYS = ("trigger", "condition", "action")
+
+# Strings a YAML 1.1 loader (Home Assistant's PyYAML) resolves to a NON-string:
+# bool / null / merge / value, every int form INCLUDING sexagesimal
+# (``10:00:00`` -> 36000), every float form including sexagesimal and inf/nan,
+# and timestamps. Mirrors PyYAML's SafeLoader implicit resolvers; validated for
+# exact parity against PyYAML. Used to decide which plain scalars to force-quote
+# so they survive HA's reader as strings.
+_YAML11_AMBIGUOUS = re.compile(
+    r"""^(?:
+        yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF
+        |~|null|Null|NULL|
+        |<<|=
+        |[-+]?0b[0-1_]+
+        |[-+]?0[0-7_]+
+        |[-+]?(?:0|[1-9][0-9_]*)
+        |[-+]?0x[0-9a-fA-F_]+
+        |[-+]?[1-9][0-9_]*(?::[0-5]?[0-9])+
+        |[-+]?(?:[0-9][0-9_]*)?\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+        |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*
+        |[-+]?\.(?:inf|Inf|INF)
+        |\.(?:nan|NaN|NAN)
+        |[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]
+        |[0-9][0-9][0-9][0-9]-[0-9][0-9]?-[0-9][0-9]?
+        (?:[Tt]|[ \t]+)[0-9][0-9]?:[0-9][0-9]:[0-9][0-9]
+        (?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9][0-9]?(?::[0-9][0-9])?))?
+    )$""",
+    re.VERBOSE,
+)
 
 
 class AutomationWriteError(ValueError):
@@ -131,12 +169,7 @@ def list_agent_automations(path: str | Path) -> list[dict]:
 
 
 def accept_draft(path: str | Path, automation_id: str) -> dict:
-    """Accept an agent draft: remove its forced-disabled flag (SPEC §6).
-
-    Removing ``initial_state: false`` is what makes acceptance stick — while
-    the flag is present, Home Assistant re-disables the automation on every
-    restart regardless of any UI toggle. Scoped to agent-prefixed ids only.
-    """
+    """Accept an agent draft: remove its forced-disabled flag (SPEC §6)."""
     target = Path(path)
     yaml = _yaml()
     data = _load_list(target, yaml, must_exist=True)
@@ -154,11 +187,7 @@ def accept_draft(path: str | Path, automation_id: str) -> dict:
 
 
 def discard_draft(path: str | Path, automation_id: str) -> dict:
-    """Remove one agent-managed automation entirely (explicit user action).
-
-    Scoped to agent-prefixed ids only; user-authored automations can never be
-    touched through this path.
-    """
+    """Remove one agent-managed automation entirely (explicit user action)."""
     target = Path(path)
     yaml = _yaml()
     data = _load_list(target, yaml, must_exist=True)
@@ -172,12 +201,7 @@ def discard_draft(path: str | Path, automation_id: str) -> dict:
 
 
 def list_agent_automation_bodies(path: str | Path) -> list[dict]:
-    """Full plain-mapping bodies of every agent-managed automation (SPEC §13).
-
-    A missing file means none. Agent-scoped like every other read; used by
-    the stale-detection scan, which needs whole bodies rather than the
-    review-surface summaries.
-    """
+    """Full plain-mapping bodies of every agent-managed automation (SPEC §13)."""
     target = Path(path)
     if not target.exists():
         return []
@@ -191,12 +215,7 @@ def list_agent_automation_bodies(path: str | Path) -> list[dict]:
 
 
 def get_agent_automation(path: str | Path, automation_id: str) -> dict:
-    """Return one agent-managed automation as a plain mapping (SPEC §12).
-
-    Scoped to agent-prefixed ids only, consistent with every other
-    agent-scoped operation; user-authored automations are unreachable
-    through this path.
-    """
+    """Return one agent-managed automation as a plain mapping (SPEC §12)."""
     target = Path(path)
     data = _load_list(target, _yaml(), must_exist=True)
     index = _find_agent_entry(data, automation_id)
@@ -204,14 +223,7 @@ def get_agent_automation(path: str | Path, automation_id: str) -> dict:
 
 
 def replace_agent_automation(path: str | Path, automation_id: str, body: dict) -> dict:
-    """Replace one agent-managed automation's body in place (SPEC §12).
-
-    The rollback write path: the entry must already exist and keeps its
-    position in the file; the body's id must be absent or equal to
-    ``automation_id`` (an id can never change through a replace). Round-trip
-    validated, backed up, atomic — the same guarantees as every other write
-    path (SPEC §6).
-    """
+    """Replace one agent-managed automation's body in place (SPEC §12)."""
     if not isinstance(body, dict):
         raise AutomationWriteError("replacement body must be a mapping")
     replacement = dict(body)
@@ -243,7 +255,41 @@ def _plain(value):
         return {str(key): _plain(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_plain(item) for item in value]
+    if isinstance(value, ScalarString):
+        return str(value)
     return value
+
+
+def _needs_yaml11_quote(value) -> bool:
+    """True for a plain str a YAML 1.1 loader would resolve to a non-string."""
+    return (
+        isinstance(value, str)
+        and not isinstance(value, ScalarString)
+        and bool(_YAML11_AMBIGUOUS.match(value))
+    )
+
+
+def _quote_yaml11_ambiguous(node) -> None:
+    """Force a quoted style on YAML-1.1-ambiguous plain scalars, in place.
+
+    Mutates ``node`` so ruamel round-trip metadata (comments, key order, and
+    existing quote styles) on untouched nodes survives. Only plain ``str`` is
+    considered; scalars already loaded as ruamel ScalarString keep their own
+    style. This is what stops HA's YAML 1.1 loader from retyping ``at:
+    10:00:00`` into the integer 36000 (and ``to: on`` into a bool, etc.).
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, (dict, list)):
+                _quote_yaml11_ambiguous(value)
+            elif _needs_yaml11_quote(value):
+                node[key] = SingleQuotedScalarString(value)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            if isinstance(value, (dict, list)):
+                _quote_yaml11_ambiguous(value)
+            elif _needs_yaml11_quote(value):
+                node[index] = SingleQuotedScalarString(value)
 
 
 def _load_list(target: Path, yaml: YAML, *, must_exist: bool = False) -> list:
@@ -267,16 +313,35 @@ def _load_list(target: Path, yaml: YAML, *, must_exist: bool = False) -> list:
     return data
 
 
+def _yaml_1_1() -> YAML:
+    """A round-trip loader pinned to YAML 1.1 — Home Assistant's read semantics.
+
+    Used only to verify what HA will actually parse back from our output, so
+    the scalar-coercion guard sees the same retyping HA would.
+    """
+    yaml = YAML()
+    yaml.version = (1, 1)  # type: ignore[assignment]
+    return yaml
+
+
 def _dump_validated(yaml: YAML, data: list) -> str:
-    """Serialize and re-parse in memory; the result must survive a round trip."""
+    """Serialize and re-parse in memory; the result must survive a round trip.
+
+    Two guards: (1) quote YAML-1.1-ambiguous scalars so HA's loader keeps them
+    as strings, and (2) reparse the emitted text with HA's YAML 1.1 semantics
+    and abort if any scalar's value changed — no silent coercion can ship.
+    """
+    _quote_yaml11_ambiguous(data)
     buffer = StringIO()
     yaml.dump(data, buffer)
     new_text = buffer.getvalue()
-    reparsed = _yaml().load(new_text)
+    reparsed = _yaml_1_1().load(new_text)
     if reparsed is None:
         reparsed = []
     if not isinstance(reparsed, list) or len(reparsed) != len(data):
         raise AutomationWriteError("round-trip validation failed; write aborted")
+    if _plain(reparsed) != _plain(data):
+        raise AutomationWriteError("round-trip changed a scalar's value; write aborted")
     return new_text
 
 

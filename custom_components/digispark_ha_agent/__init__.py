@@ -39,9 +39,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up DigiSpark HA Agent from a config entry (SPEC.md §8–§9)."""
     from homeassistant.helpers.aiohttp_client import async_get_clientsession
     from homeassistant.helpers.event import async_track_time_interval
+    from homeassistant.helpers.start import async_at_started
 
     from .agent.tools import HomeToolRunner, tool_schemas
-    from .ha_bridge import async_scan_patterns, async_scan_stale, build_adapters
+    from .ha_bridge import (
+        async_scan_stale,
+        build_adapters,
+        request_suggestion_scan,
+    )
     from .panel import async_register_panel
     from .ws import async_register_ws_handlers
 
@@ -76,12 +81,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    # Periodic pattern-detection scan (SPEC §11); cancelled on unload.
+    # Periodic pattern-detection scan (SPEC §11): lock-guarded and run in the
+    # background, never on the request path (SPEC §11 perf); cancelled on unload.
     async def _scheduled_pattern_scan(_now) -> None:
-        try:
-            await async_scan_patterns(hass)
-        except Exception:
-            _LOGGER.exception("scheduled pattern scan failed")
+        request_suggestion_scan(hass)
 
     entry.async_on_unload(
         async_track_time_interval(
@@ -90,6 +93,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             timedelta(hours=PATTERN_SCAN_INTERVAL_HOURS),
         )
     )
+
+    # Warm the suggestion + stale caches once HA has fully started (recorder
+    # ready) so the panel never triggers a cold scan on first open (SPEC §11
+    # perf). The pattern scan runs in the background; stale is cheap.
+    async def _warm_caches(_hass) -> None:
+        request_suggestion_scan(hass)
+        try:
+            await async_scan_stale(hass)
+        except Exception:
+            _LOGGER.exception("startup stale scan failed")
+
+    entry.async_on_unload(async_at_started(hass, _warm_caches))
 
     # Rebuild the agent when the user edits model / max-tokens in the options flow.
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))

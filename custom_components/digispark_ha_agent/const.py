@@ -65,6 +65,30 @@ PATTERN_CORRELATION_WINDOW_SECONDS = 300
 # Periodic detection-scan cadence; the WS surface supports an on-demand
 # rescan (owner decision, 2026-07-03: daily).
 PATTERN_SCAN_INTERVAL_HOURS = 24
+# Pattern-scan scope + volume bounds (SPEC.md §11 perf; owner decision
+# 2026-07-05). Detection only ever yields suggestions for controllable action
+# targets and discrete-state triggers, so restricting the recorder scan to
+# these domains — excluding continuous numerics like sensor / number /
+# weather — both bounds the (superlinear) scan and removes noise candidates.
+PATTERN_SCAN_DOMAINS: frozenset[str] = frozenset(
+    {
+        "light",
+        "switch",
+        "fan",
+        "cover",
+        "media_player",
+        "input_boolean",
+        "binary_sensor",
+        "device_tracker",
+        "person",
+    }
+)
+# A single entity contributing more state changes than this over the lookback
+# window is treated as noise (a flapping/misbehaving device) and dropped whole.
+PATTERN_MAX_EVENTS_PER_ENTITY = 5000
+# Hard ceiling on the total events handed to the engine; if exceeded after
+# per-entity filtering, the most recent are kept.
+PATTERN_MAX_TOTAL_EVENTS = 50000
 STALE_IDLE_DAYS = 30
 # Periodic advisory-only stale scan cadence (SPEC.md §13).
 STALE_SCAN_INTERVAL_HOURS = 6
