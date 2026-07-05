@@ -1,5 +1,5 @@
 /*
- * DigiSpark HA Agent — in-panel SPA (v0.6.0 sub-unit 5).
+ * DigiSpark HA Agent — in-panel SPA (v0.6.6).
  * Copyright (c) 2026 DigiSpark Advisory LLC. All rights reserved.
  * Clean-room implementation authored from SPEC.md §7, §8, §9, §11, §12, §13.
  *
@@ -1138,6 +1138,25 @@ class DigiSparkAgentPanel extends HTMLElement {
     this._refreshSessions();
   }
 
+  async _suggestForMe() {
+    if (this._busy || !this._hass) return;
+    let suggestion = null;
+    try {
+      const res = await this._ws({ type: "digispark_ha_agent/list_suggestions" });
+      const list = (res && res.suggestions) || [];
+      suggestion =
+        list.find((s) => (s.status || "pending") === "pending") || list[0] || null;
+    } catch (_err) {
+      // No suggestions available — fall through to a generic prompt.
+    }
+    const desc =
+      suggestion && suggestion.candidate && suggestion.candidate.description;
+    const prompt = desc
+      ? `I noticed this pattern in my home: ${desc}. Please create an automation for it.`
+      : "Suggest a useful automation for my home based on how I use my devices, then draft it for me.";
+    this._send(prompt);
+  }
+
   _render() {
     this.shadowRoot.innerHTML = `
       <style>
@@ -1200,6 +1219,12 @@ class DigiSparkAgentPanel extends HTMLElement {
         button:disabled { opacity: 0.6; cursor: default; }
         button.ghost { background: transparent; color: var(--primary-color, #03a9f4); border: 1px solid var(--divider-color, #e0e0e0); }
         .empty { color: var(--secondary-text-color, #727272); text-align: center; margin-top: 24px; }
+        .splash { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 14px; padding: 24px; box-sizing: border-box; }
+        .splash-mark { line-height: 0; }
+        .splash-title { margin: 0; font-size: 26px; font-weight: 600; color: var(--primary-text-color, #212121); }
+        .splash-title span { color: var(--primary-color, #03a9f4); }
+        .splash-sub { margin: 0; max-width: 360px; font-size: 14px; line-height: 1.5; color: var(--secondary-text-color, #727272); }
+        .splash-suggest { margin-top: 4px; background: transparent; color: var(--primary-color, #03a9f4); border: 1px solid var(--divider-color, #e0e0e0); border-radius: 999px; padding: 8px 18px; font-size: 13px; }
         .pending { border-top: 1px solid var(--divider-color, #e0e0e0); background: var(--card-background-color, #fff); }
         .pend { display: flex; align-items: center; gap: 8px; padding: 8px 16px; font-size: 13px; color: var(--primary-text-color, #212121); }
         .pend .what { flex: 1; }
@@ -1422,6 +1447,9 @@ class DigiSparkAgentPanel extends HTMLElement {
       this._input.value = "";
       this._send(value);
     });
+    this._log.addEventListener("click", (ev) => {
+      if (ev.target.closest("[data-splash='suggest']")) this._suggestForMe();
+    });
 
     if (typeof ResizeObserver !== "undefined") {
       this._ro = new ResizeObserver((entries) => {
@@ -1528,7 +1556,17 @@ class DigiSparkAgentPanel extends HTMLElement {
       })
       .join("");
     if (this._busy) html += `<div class="msg thinking">Thinking…</div>`;
-    if (!html) html = `<div class="empty">Ask your home a question to get started.</div>`;
+    if (!html)
+      html =
+        `<div class="splash">` +
+        `<div class="splash-mark"><svg viewBox="0 0 56 56" width="60" height="60" aria-hidden="true">` +
+        `<rect x="3" y="3" width="50" height="50" rx="14" fill="var(--card-background-color,#1c1c1c)" stroke="var(--divider-color,#e0e0e0)"/>` +
+        `<path d="M28 11 L31.6 24.4 L45 28 L31.6 31.6 L28 45 L24.4 31.6 L11 28 L24.4 24.4 Z" fill="var(--primary-color,#03a9f4)"/>` +
+        `</svg></div>` +
+        `<h2 class="splash-title">Ask <span>DigiSpark</span></h2>` +
+        `<p class="splash-sub">Describe what you want to automate — the devices, times, or conditions involved.</p>` +
+        `<button type="button" class="splash-suggest" data-splash="suggest">Suggest one for me</button>` +
+        `</div>`;
     this._log.innerHTML = html;
     this._log.scrollTop = this._log.scrollHeight;
     if (this._input) this._input.disabled = this._busy;
