@@ -51,7 +51,17 @@ LOCAL_HISTORY_TURNS = 3
 MAX_LOCAL_ENTITY_BLOCK_CHARS = 4000
 
 # Pattern-detection / stale-detection tunables (SPEC.md §11, §13).
+# Acceptance floor on a candidate's raw pass rate (consistency): how often the
+# outcome follows its trigger. Unchanged role; see PATTERN_CONFIDENCE_Z.
 PATTERN_MIN_CONFIDENCE = 0.7
+# Displayed/ranked confidence is a Wilson score lower bound on that pass rate
+# (owner decision 2026-07-05, label-not-hide): a thinly-evidenced pattern (5/5)
+# scores well below a well-evidenced one (500/500) instead of both reading
+# 100%. This changes labels + ranking only — acceptance still gates on the raw
+# rate (PATTERN_MIN_CONFIDENCE) — so nothing that surfaces today disappears.
+# z = standard-normal quantile (1.96 ≈ one-sided 97.5%); higher z = more
+# conservative (lower) scores for thin evidence.
+PATTERN_CONFIDENCE_Z = 1.96
 # Pattern detection (SPEC.md §11). History lookback the bridge feeds the
 # engine (owner decision, 2026-07-03: 14 days, exposed entities only).
 PATTERN_LOOKBACK_DAYS = 14

@@ -11,10 +11,14 @@ PATTERN_LOOKBACK_DAYS). Three signals (SPEC 11):
 - device correlations: B tends to follow A within a short window;
 - recurring sequences: a three-step ordered chain that repeats.
 
-Confidence is support/consistency - how often the pattern holds over how
-often its precondition occurs (active days for routines, occurrences of the
-first step for correlations/sequences). Candidates below the confidence
-floor or the support floor are suppressed.
+A candidate carries two scores. ``consistency`` is the raw pass rate - how
+often the pattern holds over how often its precondition occurs (active days
+for routines, precondition occurrences for correlations/sequences).
+``confidence`` is a Wilson score lower bound on that rate, so a thinly-
+evidenced pattern scores below a well-evidenced one instead of both reading
+1.0. The acceptance floors gate on consistency (plus support and distinct
+days); confidence drives display and ranking. Candidates below the floors
+are suppressed.
 
 Home-Assistant-free by design: the caller supplies the state-change events,
 so the analysis is pure and unit-testable. No raw history leaves the process;
@@ -37,6 +41,7 @@ from ..const import (
     PATTERN_BURST_ENTITY_FRACTION,
     PATTERN_BURST_MIN_ENTITIES,
     PATTERN_BURST_WINDOW_SECONDS,
+    PATTERN_CONFIDENCE_Z,
     PATTERN_CORRELATION_WINDOW_SECONDS,
     PATTERN_MIN_CONFIDENCE,
     PATTERN_MIN_DISTINCT_DAYS,
@@ -102,6 +107,7 @@ class PatternEngine:
         burst_window_seconds: int = PATTERN_BURST_WINDOW_SECONDS,
         burst_min_entities: int = PATTERN_BURST_MIN_ENTITIES,
         burst_entity_fraction: float = PATTERN_BURST_ENTITY_FRACTION,
+        confidence_z: float = PATTERN_CONFIDENCE_Z,
         tz_offset_minutes: int = 0,
     ) -> None:
         if not 0 < min_confidence <= 1:
@@ -120,6 +126,8 @@ class PatternEngine:
             raise ValueError("burst_min_entities must be >= 1")
         if not 0 < burst_entity_fraction <= 1:
             raise ValueError("burst_entity_fraction must be in (0, 1]")
+        if confidence_z <= 0:
+            raise ValueError("confidence_z must be > 0")
         self._min_confidence = min_confidence
         self._min_support = min_support
         self._min_distinct_days = min_distinct_days
@@ -128,6 +136,7 @@ class PatternEngine:
         self._burst_window = burst_window_seconds
         self._burst_min_entities = burst_min_entities
         self._burst_entity_fraction = burst_entity_fraction
+        self._confidence_z = confidence_z
         self._tz_offset_seconds = tz_offset_minutes * 60
 
     def detect(self, events: Iterable[StateEvent]) -> list[dict]:
@@ -153,7 +162,7 @@ class PatternEngine:
         sequences = [
             c
             for c in self._sequences(cleaned)
-            if c["confidence"] >= self._min_confidence
+            if c["consistency"] >= self._min_confidence
         ]
         # A surviving three-step sequence subsumes its own first hop; the
         # bare (A, B) correlation would only restate it as noise.
@@ -162,7 +171,7 @@ class PatternEngine:
             c
             for c in self._correlations(cleaned, suppress=prefixes)
             + self._time_of_day(cleaned)
-            if c["confidence"] >= self._min_confidence
+            if c["consistency"] >= self._min_confidence
         ]
         return sorted(candidates, key=lambda c: (-c["confidence"], c["signature"]))
 
@@ -233,7 +242,11 @@ class PatternEngine:
                     {
                         "kind": KIND_TIME_OF_DAY,
                         "entities": [entity_id],
-                        "confidence": round(days_hit / total_days, 3),
+                        "confidence": round(
+                            _confidence_score(days_hit, total_days, self._confidence_z),
+                            3,
+                        ),
+                        "consistency": round(days_hit / total_days, 3),
                         "support": days_hit,
                         "occurrences": total_days,
                         "description": (
@@ -293,7 +306,11 @@ class PatternEngine:
                 {
                     "kind": KIND_CORRELATION,
                     "entities": [entity_a, entity_b],
-                    "confidence": round(support / occurrences, 3),
+                    "confidence": round(
+                        _confidence_score(support, occurrences, self._confidence_z),
+                        3,
+                    ),
+                    "consistency": round(support / occurrences, 3),
                     "support": support,
                     "occurrences": occurrences,
                     "description": (
@@ -360,7 +377,11 @@ class PatternEngine:
                 {
                     "kind": KIND_SEQUENCE,
                     "entities": [entity_id for entity_id, _ in triple],
-                    "confidence": round(support / occurrences, 3),
+                    "confidence": round(
+                        _confidence_score(support, occurrences, self._confidence_z),
+                        3,
+                    ),
+                    "consistency": round(support / occurrences, 3),
                     "support": support,
                     "occurrences": occurrences,
                     "description": (
@@ -425,3 +446,21 @@ def _steps_prefix(candidate: dict) -> tuple[_Key, _Key]:
 
 def _hhmm(minute_of_day: int) -> str:
     return f"{minute_of_day // 60:02d}:{minute_of_day % 60:02d}"
+
+
+def _confidence_score(support: int, occurrences: int, z: float) -> float:
+    """Wilson score lower bound on the pass rate ``support / occurrences``.
+
+    Evidence-aware: for a perfect rate it reduces to ``n / (n + z**2)``, so a
+    pattern seen 5/5 scores well below one seen 500/500. ``z`` is the
+    standard-normal quantile; larger ``z`` is more conservative. Result is
+    clamped to ``[0, 1]``.
+    """
+    if occurrences <= 0:
+        return 0.0
+    n = occurrences
+    p = support / n
+    z2 = z * z
+    centre = p + z2 / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z2 / (4 * n)) / n)
+    return max(0.0, min(1.0, (centre - margin) / (1 + z2 / n)))
