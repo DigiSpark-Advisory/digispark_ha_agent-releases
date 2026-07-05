@@ -89,6 +89,10 @@ PATTERN_MAX_EVENTS_PER_ENTITY = 5000
 # Hard ceiling on the total events handed to the engine; if exceeded after
 # per-entity filtering, the most recent are kept.
 PATTERN_MAX_TOTAL_EVENTS = 50000
+# Entities per recorder-history batch when scanning (SPEC.md §11 perf). Reading
+# the lookback for every in-scope entity at once can spike memory on a large
+# recorder DB; batching bounds peak memory to one batch.
+PATTERN_SCAN_BATCH_SIZE = 25
 STALE_IDLE_DAYS = 30
 # Periodic advisory-only stale scan cadence (SPEC.md §13).
 STALE_SCAN_INTERVAL_HOURS = 6

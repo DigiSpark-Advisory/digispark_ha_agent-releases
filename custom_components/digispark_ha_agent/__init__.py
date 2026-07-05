@@ -94,11 +94,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    # Warm the suggestion + stale caches once HA has fully started (recorder
-    # ready) so the panel never triggers a cold scan on first open (SPEC §11
-    # perf). The pattern scan runs in the background; stale is cheap.
+    # Warm only the (cheap) stale cache once HA has fully started. The pattern
+    # scan is deliberately NOT run at boot: on a large recorder DB the history
+    # read can spike memory, and a boot-time scan turned that into an OOM /
+    # reboot loop. Suggestions are seeded from the persisted store on first
+    # panel open and refreshed by the on-demand / periodic scan instead.
     async def _warm_caches(_hass) -> None:
-        request_suggestion_scan(hass)
         try:
             await async_scan_stale(hass)
         except Exception:

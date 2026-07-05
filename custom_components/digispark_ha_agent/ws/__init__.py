@@ -39,6 +39,7 @@ from ..ha_bridge import (
     async_session_history,
     async_stale_advisories,
     async_test_provider_connection,
+    async_update_automation,
     async_update_provider_settings,
 )
 from ..patterns.suggestions import SuggestionStoreError
@@ -72,6 +73,7 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_list_versions)
     websocket_api.async_register_command(hass, websocket_get_version)
     websocket_api.async_register_command(hass, websocket_rollback)
+    websocket_api.async_register_command(hass, websocket_update_automation)
     websocket_api.async_register_command(hass, websocket_stale_advisories)
     websocket_api.async_register_command(hass, websocket_list_suggestions)
     websocket_api.async_register_command(hass, websocket_dismiss_suggestion)
@@ -413,6 +415,29 @@ async def websocket_rollback(
         connection.send_error(msg["id"], "rollback_failed", str(err))
         return
     connection.send_result(msg["id"], {"restored": result})
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "digispark_ha_agent/update_automation",
+        vol.Required("automation_id"): str,
+        vol.Required("body"): dict,
+    }
+)
+@websocket_api.async_response
+async def websocket_update_automation(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict
+) -> None:
+    """Replace an agent automation's body from the editor (SPEC.md §6, §12)."""
+    try:
+        result = await async_update_automation(
+            hass, msg["automation_id"], msg["body"], author=_author(connection)
+        )
+    except (AutomationWriteError, VersionStoreError) as err:
+        connection.send_error(msg["id"], "update_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"updated": result})
 
 
 @websocket_api.require_admin

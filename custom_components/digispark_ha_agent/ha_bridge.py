@@ -22,6 +22,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from .agent.tools import HomeAdapters
+from .automations.edit import validate_automation_body
 from .automations.writer import (
     accept_draft,
     discard_draft,
@@ -39,6 +40,7 @@ from .const import (
     PATTERN_LOOKBACK_DAYS,
     PATTERN_MAX_EVENTS_PER_ENTITY,
     PATTERN_MAX_TOTAL_EVENTS,
+    PATTERN_SCAN_BATCH_SIZE,
     PATTERN_SCAN_DOMAINS,
     PROVIDER_ANTHROPIC,
     PROVIDER_LOCAL,
@@ -380,6 +382,44 @@ async def async_rollback(
     return {**result, "version": new_record["version"]}
 
 
+async def async_update_automation(
+    hass: HomeAssistant, automation_id: str, body: dict, *, author: str = "user"
+) -> dict:
+    """Replace one agent automation's body from the editor (SPEC §6, §12).
+
+    Validates the edited body has a trigger and an action, writes it through the
+    §6 writer (validated, backed up, atomic, YAML-1.1-safe), reloads, and records
+    the result as a new ``edit`` version. Agent-scoped ids only, like every
+    other write path.
+    """
+    validate_automation_body(body)
+    result = await hass.async_add_executor_job(
+        replace_agent_automation,
+        hass.config.path("automations.yaml"),
+        automation_id,
+        body,
+    )
+    await hass.services.async_call("automation", "reload", blocking=True)
+    try:
+        saved = await hass.async_add_executor_job(
+            get_agent_automation, hass.config.path("automations.yaml"), automation_id
+        )
+    except Exception:
+        _LOGGER.exception(
+            "could not read %s after an edit for version recording", automation_id
+        )
+        saved = {**body, "id": automation_id}
+    await _record_version(
+        hass,
+        automation_id,
+        action="edit",
+        body=saved,
+        author=author,
+        note="edited by the user",
+    )
+    return result
+
+
 # --- Stale detection (advisory-only, SPEC §13) ---------------------------------
 
 
@@ -500,8 +540,10 @@ async def async_scan_patterns(hass: HomeAssistant) -> dict:
     Scope + volume are bounded (SPEC §11 perf; owner decision 2026-07-05):
     only ``PATTERN_SCAN_DOMAINS`` entities are read from the recorder, any
     single entity emitting more than ``PATTERN_MAX_EVENTS_PER_ENTITY`` changes
-    is dropped as noise, and the engine sees at most ``PATTERN_MAX_TOTAL_EVENTS``
-    (most recent) events. History (SPEC §11; owner decision 2026-07-03): the
+    is dropped as noise, the engine sees at most ``PATTERN_MAX_TOTAL_EVENTS``
+    (most recent) events, and history is read in ``PATTERN_SCAN_BATCH_SIZE``-entity
+    batches with attributes dropped so a large recorder DB can't spike memory.
+    History (SPEC §11; owner decision 2026-07-03): the
     last ``PATTERN_LOOKBACK_DAYS`` days of state changes for exposed, in-scope
     entities only, read from the local recorder — raw history never leaves the
     process. Candidates that cannot be synthesized deterministically are dropped
@@ -517,16 +559,25 @@ async def async_scan_patterns(hass: HomeAssistant) -> dict:
     )
     if entity_ids:
         start = dt_util.utcnow() - timedelta(days=PATTERN_LOOKBACK_DAYS)
-        states = await get_instance(hass).async_add_executor_job(
-            history.get_significant_states, hass, start, None, entity_ids
-        )
-        events_by_entity = {
-            entity_id: [
-                StateEvent(entity_id, s.state, s.last_changed.timestamp())
-                for s in entity_states
-            ]
-            for entity_id, entity_states in states.items()
-        }
+        recorder = get_instance(hass)
+        events_by_entity: dict[str, list[StateEvent]] = {}
+        for i in range(0, len(entity_ids), PATTERN_SCAN_BATCH_SIZE):
+            batch = entity_ids[i : i + PATTERN_SCAN_BATCH_SIZE]
+            states = await recorder.async_add_executor_job(
+                partial(
+                    history.get_significant_states,
+                    hass,
+                    start,
+                    None,
+                    batch,
+                    no_attributes=True,
+                )
+            )
+            for entity_id, entity_states in states.items():
+                events_by_entity[entity_id] = [
+                    StateEvent(entity_id, s.state, s.last_changed.timestamp())
+                    for s in entity_states
+                ]
         events = bound_events(
             events_by_entity,
             per_entity_cap=PATTERN_MAX_EVENTS_PER_ENTITY,
@@ -567,17 +618,24 @@ def request_suggestion_scan(hass: HomeAssistant) -> bool:
 
 
 async def async_list_suggestions(hass: HomeAssistant, *, rescan: bool = False) -> dict:
-    """Cached suggestions; kick off a background scan when asked or empty.
+    """Cached suggestions; seed from the store on cold start, refresh in the bg.
 
-    Never blocks: an empty cache (e.g. after a restart) or an explicit rescan
-    starts a background scan and returns immediately with ``scanning: True`` so
-    the panel shows progress rather than hanging on the cold scan (SPEC §11).
+    Never blocks. On a cold cache (e.g. after a restart) the persisted
+    suggestions are seeded from the store first (fast, no recorder scan) so the
+    panel shows the last-known results immediately, and a background scan runs to
+    refresh them; an explicit rescan does the same (SPEC §11 perf).
     """
     domain_data = hass.data.get(DOMAIN, {})
     cached = domain_data.get(_SUGGESTION_SCAN)
-    scanning = bool(domain_data.get(_SUGGESTION_SCANNING))
-    if rescan or cached is None:
+    if rescan:
         scanning = request_suggestion_scan(hass)
+    elif cached is None:
+        # Cold start after a restart: show the persisted suggestions at once
+        # (fast store read, no recorder scan) while a fresh scan runs in the bg.
+        cached = await _cache_pending(hass, "")
+        scanning = request_suggestion_scan(hass)
+    else:
+        scanning = bool(domain_data.get(_SUGGESTION_SCANNING))
     result = cached or {"suggestions": [], "scanned_at": None}
     return {**result, "scanning": scanning}
 
@@ -598,7 +656,12 @@ async def async_dismiss_suggestion(
 async def async_accept_suggestion(
     hass: HomeAssistant, signature: str, *, author: str = "user"
 ) -> dict:
-    """Accept one pending suggestion into a §6 draft automation."""
+    """Accept one pending suggestion into a §6 draft automation.
+
+    The synthesized body writes through the normal draft path — disabled,
+    agent-prefixed, version-recorded — and then shows up in the drafts inbox
+    for the usual review/enable step. Nothing is enabled here.
+    """
     store = _suggestion_store(hass)
     record = await hass.async_add_executor_job(store.get, signature)
     if record["status"] != STATUS_PENDING:
