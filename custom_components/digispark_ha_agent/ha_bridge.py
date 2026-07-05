@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 from functools import partial
 from typing import TYPE_CHECKING
@@ -513,6 +514,30 @@ def _exposed_entity_ids(hass: HomeAssistant) -> set[str]:
     return exposed
 
 
+def _entities_with_area(hass: HomeAssistant) -> set[str]:
+    """Entity ids with an assigned area, directly or via their device.
+
+    Physical home devices live in areas; add-on ``*_running`` status sensors
+    and system helpers typically do not. Requiring an area keeps the pattern
+    scan on placeable devices and drops the infrastructure entities behind the
+    boot-artifact suggestions (owner report 2026-07-05, fix #2).
+    """
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    registry = er.async_get(hass)
+    devices = dr.async_get(hass)
+    placed: set[str] = set()
+    for entity_id, entry in registry.entities.items():
+        if entry.area_id:
+            placed.add(entity_id)
+        elif entry.device_id:
+            device = devices.devices.get(entry.device_id)
+            if device and device.area_id:
+                placed.add(entity_id)
+    return placed
+
+
 def _suggestion_store(hass: HomeAssistant) -> SuggestionStore:
     """Return the shared suggestion store, creating it on first use."""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -538,7 +563,9 @@ async def async_scan_patterns(hass: HomeAssistant) -> dict:
     """Run one detection pass over recorder history and update the store.
 
     Scope + volume are bounded (SPEC §11 perf; owner decision 2026-07-05):
-    only ``PATTERN_SCAN_DOMAINS`` entities are read from the recorder, any
+    only ``PATTERN_SCAN_DOMAINS`` entities that also have an assigned area
+    (real, placeable devices — not add-on status sensors or system helpers)
+    are read from the recorder, any
     single entity emitting more than ``PATTERN_MAX_EVENTS_PER_ENTITY`` changes
     is dropped as noise, the engine sees at most ``PATTERN_MAX_TOTAL_EVENTS``
     (most recent) events, and history is read in ``PATTERN_SCAN_BATCH_SIZE``-entity
@@ -552,11 +579,19 @@ async def async_scan_patterns(hass: HomeAssistant) -> dict:
     from homeassistant.components.recorder import get_instance, history
     from homeassistant.util import dt as dt_util
 
+    exposed = _exposed_entity_ids(hass)
+    placed = _entities_with_area(hass)
     entity_ids = sorted(
         entity_id
-        for entity_id in _exposed_entity_ids(hass)
-        if in_scan_scope(entity_id, PATTERN_SCAN_DOMAINS)
+        for entity_id in exposed
+        if in_scan_scope(entity_id, PATTERN_SCAN_DOMAINS) and entity_id in placed
     )
+    _LOGGER.debug(
+        "pattern scan: %d exposed, %d in-scope with an assigned area",
+        len(exposed),
+        len(entity_ids),
+    )
+    scan_started = time.monotonic()
     if entity_ids:
         start = dt_util.utcnow() - timedelta(days=PATTERN_LOOKBACK_DAYS)
         recorder = get_instance(hass)
@@ -590,6 +625,17 @@ async def async_scan_patterns(hass: HomeAssistant) -> dict:
         actionable = [c for c in candidates if synthesize_automation(c) is not None]
         store = _suggestion_store(hass)
         await hass.async_add_executor_job(store.upsert_candidates, actionable)
+        _LOGGER.info(
+            "pattern scan complete: %d entities, %d events, %d candidates, "
+            "%d actionable in %.1fs",
+            len(entity_ids),
+            len(events),
+            len(candidates),
+            len(actionable),
+            time.monotonic() - scan_started,
+        )
+    else:
+        _LOGGER.info("pattern scan: no in-scope entities with an assigned area")
     return await _cache_pending(hass, utc_now_iso())
 
 

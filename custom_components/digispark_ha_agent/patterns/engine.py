@@ -27,14 +27,19 @@ underlying pattern materially changes (owner decision 2026-07-03).
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
 from ..const import (
+    PATTERN_BURST_ENTITY_FRACTION,
+    PATTERN_BURST_MIN_ENTITIES,
+    PATTERN_BURST_WINDOW_SECONDS,
     PATTERN_CORRELATION_WINDOW_SECONDS,
     PATTERN_MIN_CONFIDENCE,
+    PATTERN_MIN_DISTINCT_DAYS,
     PATTERN_MIN_SUPPORT,
     PATTERN_TIME_TOLERANCE_MINUTES,
 )
@@ -91,22 +96,38 @@ class PatternEngine:
         *,
         min_confidence: float = PATTERN_MIN_CONFIDENCE,
         min_support: int = PATTERN_MIN_SUPPORT,
+        min_distinct_days: int = PATTERN_MIN_DISTINCT_DAYS,
         time_tolerance_minutes: int = PATTERN_TIME_TOLERANCE_MINUTES,
         correlation_window_seconds: int = PATTERN_CORRELATION_WINDOW_SECONDS,
+        burst_window_seconds: int = PATTERN_BURST_WINDOW_SECONDS,
+        burst_min_entities: int = PATTERN_BURST_MIN_ENTITIES,
+        burst_entity_fraction: float = PATTERN_BURST_ENTITY_FRACTION,
         tz_offset_minutes: int = 0,
     ) -> None:
         if not 0 < min_confidence <= 1:
             raise ValueError("min_confidence must be in (0, 1]")
         if min_support < 1:
             raise ValueError("min_support must be >= 1")
+        if min_distinct_days < 1:
+            raise ValueError("min_distinct_days must be >= 1")
         if time_tolerance_minutes < 1:
             raise ValueError("time_tolerance_minutes must be >= 1")
         if correlation_window_seconds < 1:
             raise ValueError("correlation_window_seconds must be >= 1")
+        if burst_window_seconds < 1:
+            raise ValueError("burst_window_seconds must be >= 1")
+        if burst_min_entities < 1:
+            raise ValueError("burst_min_entities must be >= 1")
+        if not 0 < burst_entity_fraction <= 1:
+            raise ValueError("burst_entity_fraction must be in (0, 1]")
         self._min_confidence = min_confidence
         self._min_support = min_support
+        self._min_distinct_days = min_distinct_days
         self._tolerance = time_tolerance_minutes
         self._window = correlation_window_seconds
+        self._burst_window = burst_window_seconds
+        self._burst_min_entities = burst_min_entities
+        self._burst_entity_fraction = burst_entity_fraction
         self._tz_offset_seconds = tz_offset_minutes * 60
 
     def detect(self, events: Iterable[StateEvent]) -> list[dict]:
@@ -126,6 +147,9 @@ class PatternEngine:
         )
         if not cleaned:
             return []
+        cleaned = self._drop_bursts(cleaned)
+        if not cleaned:
+            return []
         sequences = [
             c
             for c in self._sequences(cleaned)
@@ -141,6 +165,48 @@ class PatternEngine:
             if c["confidence"] >= self._min_confidence
         ]
         return sorted(candidates, key=lambda c: (-c["confidence"], c["signature"]))
+
+    # -- startup-cascade filter ----------------------------------------------
+
+    def _drop_bursts(self, events: Sequence[StateEvent]) -> list[StateEvent]:
+        """Remove events inside startup-cascade windows.
+
+        On every Home Assistant restart a large fraction of entities change
+        state within a few seconds - add-on ``*_running`` sensors flip on,
+        helpers restore their last value. Those co-occurrences are boot
+        artifacts, not behaviour, yet they inflated the correlation engine
+        (owner report 2026-07-05). Any ``_burst_window``-second span in which
+        at least ``threshold`` distinct entities change is treated as a
+        cascade and dropped. The threshold scales with the dataset (a
+        fraction of the distinct entities present) but never dips below
+        ``_burst_min_entities``, so ordinary multi-device activity - a scene,
+        one busy room - is never mistaken for a cascade.
+        """
+        total_entities = len({e.entity_id for e in events})
+        if total_entities < self._burst_min_entities:
+            return list(events)
+        threshold = max(
+            self._burst_min_entities,
+            math.ceil(total_entities * self._burst_entity_fraction),
+        )
+        counts: dict[str, int] = {}
+        distinct = 0
+        left = 0
+        burst = [False] * len(events)
+        for right, event in enumerate(events):
+            if counts.get(event.entity_id, 0) == 0:
+                distinct += 1
+            counts[event.entity_id] = counts.get(event.entity_id, 0) + 1
+            while event.when - events[left].when > self._burst_window:
+                left_id = events[left].entity_id
+                counts[left_id] -= 1
+                if counts[left_id] == 0:
+                    distinct -= 1
+                left += 1
+            if distinct >= threshold:
+                for index in range(left, right + 1):
+                    burst[index] = True
+        return [event for index, event in enumerate(events) if not burst[index]]
 
     # -- time-of-day routines ------------------------------------------------
 
@@ -194,6 +260,7 @@ class PatternEngine:
     ) -> list[dict]:
         hits: dict[tuple[_Key, _Key], int] = {}
         delays: dict[tuple[_Key, _Key], list[float]] = {}
+        days: dict[tuple[_Key, _Key], set[int]] = {}
         first_counts: dict[_Key, int] = {}
         for i, first in enumerate(events):
             key_a = _key(first)
@@ -209,6 +276,7 @@ class PatternEngine:
                 pair = (key_a, key_b)
                 hits[pair] = hits.get(pair, 0) + 1
                 delays.setdefault(pair, []).append(follower.when - first.when)
+                days.setdefault(pair, set()).add(self._day_index(first.when))
         candidates: list[dict] = []
         for pair in sorted(hits):
             if pair in suppress:
@@ -217,6 +285,8 @@ class PatternEngine:
             support = hits[pair]
             occurrences = first_counts[pair[0]]
             if support < self._min_support:
+                continue
+            if len(days[pair]) < self._min_distinct_days:
                 continue
             delay = round(statistics.median(delays[pair]))
             candidates.append(
@@ -247,6 +317,7 @@ class PatternEngine:
 
     def _sequences(self, events: Sequence[StateEvent]) -> list[dict]:
         hits: dict[tuple[_Key, _Key, _Key], int] = {}
+        days: dict[tuple[_Key, _Key, _Key], set[int]] = {}
         first_counts: dict[_Key, int] = {}
         for i, first in enumerate(events):
             key_a = _key(first)
@@ -269,11 +340,14 @@ class PatternEngine:
                     seen_c.add(key_c)
                     triple = (key_a, key_b, key_c)
                     hits[triple] = hits.get(triple, 0) + 1
+                    days.setdefault(triple, set()).add(self._day_index(first.when))
         candidates: list[dict] = []
         for triple in sorted(hits):
             support = hits[triple]
             occurrences = first_counts[triple[0]]
             if support < self._min_support:
+                continue
+            if len(days[triple]) < self._min_distinct_days:
                 continue
             steps = [
                 {"entity_id": entity_id, "state": state} for entity_id, state in triple

@@ -58,10 +58,26 @@ PATTERN_LOOKBACK_DAYS = 14
 # Distinct occurrences (days for routines, precondition events for
 # correlations/sequences) required before a candidate is considered.
 PATTERN_MIN_SUPPORT = 3
+# Correlations/sequences must recur across at least this many DISTINCT calendar
+# days (owner decision 2026-07-05, fix #3). Raw occurrence counts let a single
+# busy session or a restart storm reach full support; requiring spread across
+# days keeps a same-day fluke from ever becoming a suggestion.
+PATTERN_MIN_DISTINCT_DAYS = 2
 # Gap threshold when clustering time-of-day occurrences, minutes.
 PATTERN_TIME_TOLERANCE_MINUTES = 30
 # Window in which B must follow A for correlations/sequences, seconds.
 PATTERN_CORRELATION_WINDOW_SECONDS = 300
+# Startup-cascade exclusion (owner report 2026-07-05, fix #1). Every HA restart
+# flips a large fraction of entities within a few seconds (add-on *_running
+# sensors, restored helpers); those co-occurrences are boot artifacts, not
+# behaviour. Any PATTERN_BURST_WINDOW_SECONDS window in which at least the burst
+# threshold of distinct entities change is dropped. The threshold scales with
+# the data — max(PATTERN_BURST_MIN_ENTITIES, fraction x distinct entities
+# present) — so ordinary multi-device activity (a scene, one busy room) is never
+# mistaken for a cascade.
+PATTERN_BURST_WINDOW_SECONDS = 60
+PATTERN_BURST_MIN_ENTITIES = 8
+PATTERN_BURST_ENTITY_FRACTION = 0.5
 # Periodic detection-scan cadence; the WS surface supports an on-demand
 # rescan (owner decision, 2026-07-03: daily).
 PATTERN_SCAN_INTERVAL_HOURS = 24
